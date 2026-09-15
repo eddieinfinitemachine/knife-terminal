@@ -8,10 +8,10 @@ final class UnixSocketServer {
     private var fd: Int32 = -1
     private var boundInode: ino_t = 0
     private var acceptSource: DispatchSourceRead?
-    private let onMessage: (String) -> Void
+    private let onMessage: (String) -> String?   // reply (written back before close), if any
     private let queue = DispatchQueue(label: "knife.socket")
 
-    init(path: String, onMessage: @escaping (String) -> Void) {
+    init(path: String, onMessage: @escaping (String) -> String?) {
         self.path = path
         self.onMessage = onMessage
     }
@@ -23,6 +23,7 @@ final class UnixSocketServer {
         unlink(path)
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return }
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         var addr = makeAddr()
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bound = withUnsafePointer(to: &addr) {
@@ -74,6 +75,9 @@ final class UnixSocketServer {
     private func acceptOne() {
         let client = accept(fd, nil, nil)
         guard client >= 0 else { return }
+        // a "tab open" forks a shell while this connection is live — without CLOEXEC the
+        // child inherits it and the client never sees EOF after the reply
+        _ = fcntl(client, F_SETFD, FD_CLOEXEC)
         queue.async { [weak self] in
             var buf = Data()
             var chunk = [UInt8](repeating: 0, count: 4096)
@@ -83,8 +87,11 @@ final class UnixSocketServer {
                 buf.append(contentsOf: chunk[0..<n])
                 if buf.count > 512 * 1024 { break }
             }
+            if let s = String(data: buf, encoding: .utf8), !s.isEmpty, let reply = self?.onMessage(s) {
+                // client half-closed its write side (python shutdown(SHUT_WR)) and is waiting for this
+                _ = reply.utf8CString.withUnsafeBufferPointer { write(client, $0.baseAddress, $0.count - 1) }
+            }
             close(client)
-            if let s = String(data: buf, encoding: .utf8), !s.isEmpty { self?.onMessage(s) }
         }
     }
 
@@ -312,7 +319,7 @@ enum Projects {
         }
 
         return paths
-            .filter { !$0.contains("/.claude-worktrees/") }
+            .filter { !$0.contains("/.claude-worktrees/") && !$0.contains("/.knife/") && fm.fileExists(atPath: $0) }
             .compactMap { p -> Project? in
                 var isDir: ObjCBool = false
                 guard fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue else { return nil }

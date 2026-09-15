@@ -57,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "Make Default Terminal…", action: #selector(setDefault), keyEquivalent: "").target = self
         appMenu.addItem(withTitle: "Install Claude Code Alert Hooks…", action: #selector(installHooks), keyEquivalent: "").target = self
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "New Project from Folder…", action: #selector(adoptFolder), keyEquivalent: "").target = self
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Knife Terminal", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = appMenu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         hideOthers.keyEquivalentModifierMask = [.command, .option]
@@ -126,6 +128,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var front: KnifeWindowController? { AppModel.shared.frontWindow() }
+    @objc private func adoptFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.prompt = "Make Project"
+        panel.message = "git init + private GitHub repo (via gh), then open with Claude"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        AppModel.shared.adoptFolder(url.path)
+    }
 
     @objc private func newTab() {
         if let wc = front { wc.addTab() } else { AppModel.shared.newWindow() }

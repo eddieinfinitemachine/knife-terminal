@@ -96,6 +96,7 @@ struct SidebarView: View {
     @State private var projects: [Project] = []
     @State private var meta = Projects.SidebarMeta()
     @State private var sectioned: [(ProjectSection, [Project])] = []
+    @State private var elsewhere: [Project] = []   // in the manifest, checked out only on another Mac
     @State private var query = ""
     @State private var drag: SidebarDrag?
     @State private var hoverSection: ProjectSection?
@@ -193,6 +194,24 @@ struct SidebarView: View {
                     } else {
                         ForEach(filtered) { p in projectRow(p) }
                     }
+                    // manifest projects that only exist on another Mac — open = clone here
+                    ForEach(filteredElsewhere) { p in
+                        Button(action: { AppModel.shared.openProject(p.path, cmd: "claude"); query = ""; searchFocused = false }) {
+                            HStack(spacing: 6) {
+                                Text(Emoji.forPath(p.path)).font(.system(size: 12))
+                                Text(p.name).font(ui(11)).lineLimit(1)
+                                Spacer(minLength: 0)
+                                Text("clone").font(ui(9))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10).padding(.vertical, 3)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help("on another Mac — opens by cloning it here")
+                    }
+
+                    JobBox()
                 }
                 .padding(.vertical, 4)
             }
@@ -213,6 +232,7 @@ struct SidebarView: View {
             guard (n.object as? NSWindow) === controller.window else { return }
             rebuild()
         }
+        .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in rebuild() } // manifest syncs every ~10s
         .onReceive(NotificationCenter.default.publisher(for: .knifeFocusSearch)) { _ in
             if controller.window?.isKeyWindow ?? false { searchFocused = true }
         }
@@ -226,9 +246,13 @@ struct SidebarView: View {
         }
     }
 
-    private var filtered: [Project] {
+    private var filtered: [Project] { filter(projects) }
+    private var filteredElsewhere: [Project] { filter(elsewhere) }
+
+    private func filter(_ list: [Project]) -> [Project] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-        return projects.filter { $0.name.lowercased().contains(q) || $0.path.lowercased().contains(q) }
+        guard !q.isEmpty else { return list }
+        return list.filter { $0.name.lowercased().contains(q) || $0.path.lowercased().contains(q) }
     }
 
     private func tabRow(_ tab: TabModel) -> some View {
@@ -314,10 +338,12 @@ struct SidebarView: View {
 
     private func rebuild() {
         meta = Projects.loadMeta()
-        projects = Projects.list().map { p in
+        let (local, remote) = Manifest.sidebarProjects()
+        projects = local.map { p in
             guard let n = meta.byPath[p.path]?.name, !n.isEmpty else { return p }
             return Project(path: p.path, name: n, t: p.t)
         }
+        elsewhere = remote
         sectioned = Projects.sectioned(projects, meta: meta)
     }
 
@@ -467,6 +493,23 @@ private struct ProjectRow: View {
 enum SidebarDrag: Equatable {
     case tab(Int)
     case project(String)
+}
+
+/// Job request box: routed to a project and run in a job tab (same path as the phone).
+struct JobBox: View {
+    @State private var request = ""
+
+    var body: some View {
+        Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1).padding(.vertical, 6)
+        TextField("ask — routed to a project, run in a job tab", text: $request, axis: .vertical)
+            .textFieldStyle(.plain).font(ui(11)).lineLimit(1...4)
+            .padding(.horizontal, 10).padding(.bottom, 4)
+            .onSubmit {
+                let t = request.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { AppModel.shared.dispatchJob(t) }
+                request = ""
+            }
+    }
 }
 
 /// Live-reorders sidebar tabs: dragging a row over another swaps them as you go.

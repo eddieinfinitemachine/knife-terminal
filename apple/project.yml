@@ -11,8 +11,8 @@ settings:
     DEVELOPMENT_TEAM: L6DVQR8JB9
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "1.0.3"
-    CURRENT_PROJECT_VERSION: "1.0.3"  # CFBundleVersion must increase each release — Sparkle compares it
+    MARKETING_VERSION: "1.2.5"
+    CURRENT_PROJECT_VERSION: "1.1.2"  # CFBundleVersion must increase each release — Sparkle compares it
     # CloudKit container the Mac and iOS apps sync through (read at runtime via
     # the KnifeCloudContainer Info.plist key). Override with your own team's
     # container when signing outside CW&T — it must match the entitlements.

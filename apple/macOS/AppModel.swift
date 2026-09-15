@@ -34,7 +34,7 @@ final class AppModel: ObservableObject {
 
     func start() {
         socket = UnixSocketServer(path: (NSHomeDirectory() as NSString).appendingPathComponent(".knife-terminal.sock")) { [weak self] msg in
-            Task { @MainActor in self?.handleSocketMessage(msg) }
+            DispatchQueue.main.sync { self?.handleSocketMessage(msg) }   // sync: the reply goes back on the same connection
         }
         socket?.start()
         // App Nap suspends the process when every window is occluded, so socket
@@ -162,6 +162,40 @@ final class AppModel: ObservableObject {
                              lastActivity: Date()))
     }
 
+    // ─── Jobs: the executor runs each request in its own tab (knife-job.sh) ───
+
+    private var jobScript: String { Bundle.main.path(forResource: Manifest.scriptName, ofType: "sh") ?? "" }
+
+    func dispatchJob(_ text: String) {
+        let wc = frontWindow() ?? newWindow(withTab: false)
+        wc.addTab(TabOptions(cwd: Manifest.dir + "/jobs",
+                             cmd: "bash \(shellQuote(jobScript)) run \(shellQuote(text))",
+                             title: "job: " + String(text.prefix(40))), activateIt: false)
+    }
+
+    /// Open a project by a path from any machine's manifest entry: this
+    /// machine's checkout when it has one, else clone it first (a lazy clone
+    /// on first use — the manifest carries the remote, not the checkout).
+    func openProject(_ path: String, cmd: String) {
+        let (local, ref) = Manifest.resolve(path: path)
+        if let local { dispatchOpen(local, cmd: cmd); return }
+        guard let remote = ref?.remote else { return }
+        let dir = Manifest.dir + "/projects", name = Manifest.cloneName(remote)
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let wc = frontWindow() ?? newWindow(withTab: false)
+        wc.addTab(TabOptions(cwd: dir, cmd: "git clone \(shellQuote(remote)) \(shellQuote(name)) && cd \(shellQuote(name)) && \(cmd)",
+                             title: name, restoreCmd: cmd == "claude" ? "claude -c" : "codex resume --last"))
+    }
+
+    /// Turn a folder into a project: git init + private GitHub remote, then claude.
+    func adoptFolder(_ dir: String) {
+        Projects.touch(dir)
+        let wc = frontWindow() ?? newWindow(withTab: false)
+        wc.addTab(TabOptions(cwd: dir, cmd: "bash \(shellQuote(jobScript)) adopt . && claude",
+                             title: (dir as NSString).lastPathComponent, restoreCmd: "claude -c"))
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     // ─── Attention: Claude Code hooks ping the socket with the tab id ───
 
     static let workingEvents: Set<String> = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "TaskCompleted"]
@@ -170,8 +204,11 @@ final class AppModel: ObservableObject {
     private var pendingStop: [Int: DispatchWorkItem] = [:]
     private let stopQuiet: TimeInterval = 2.0
 
-    private func handleSocketMessage(_ msg: String) {
+    @discardableResult
+    private func handleSocketMessage(_ msg: String) -> String? {
         let trimmed = msg.trimmingCharacters(in: .whitespacesAndNewlines)
+        // "tab …" → the job overseer driving visible tabs (knife-tab, see knife-job.sh); these reply
+        if trimmed.hasPrefix("tab ") { return handleTabCommand(String(trimmed.dropFirst(4))) }
         // "open <dir>" → new tab in <dir> running claude (Finder "Open with Claude" quick action)
         if trimmed.hasPrefix("open ") {
             let dir = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -181,10 +218,23 @@ final class AppModel: ObservableObject {
                 NSApp.activate(ignoringOtherApps: true)
                 frontWindow()?.window?.makeKeyAndOrderFront(nil)
             }
-            return
+            return nil
+        }
+        // "adopt <dir>" → git init + remote + claude tab; "alert <tab> <msg>" → attention + push (job runner)
+        if trimmed.hasPrefix("adopt ") {
+            adoptFolder(String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines))
+            return nil
+        }
+        if trimmed.hasPrefix("alert ") {
+            let parts = trimmed.dropFirst(6).split(separator: " ", maxSplits: 1)
+            guard let id = parts.first.flatMap({ Int($0) }), parts.count == 2 else { return nil }
+            if let tab = tabById[id] { tab.working = false; markAttention(tab, fromBell: false) }
+            chime()
+            sync?.publishAlert(tabTitle: tabById[id]?.title ?? "job", message: String(parts[1]))
+            return nil
         }
         guard let sp = trimmed.firstIndex(where: { $0 == " " || $0 == "\n" }) ?? (Int(trimmed) != nil ? trimmed.endIndex : nil),
-              let id = Int(trimmed[trimmed.startIndex..<sp]) else { return }
+              let id = Int(trimmed[trimmed.startIndex..<sp]) else { return nil }
         var type = "stop"
         let rest = sp < trimmed.endIndex ? String(trimmed[trimmed.index(after: sp)...]) : ""
         if let data = rest.data(using: .utf8),
@@ -197,6 +247,60 @@ final class AppModel: ObservableObject {
             }
         }
         attention(id: id, type: type)
+        return nil
+    }
+
+    /// Overseer primitives — the same things a person does with a tab:
+    ///   open <dir> / shell <dir>   new tab in <dir> running claude / a plain shell → its id
+    ///   type <id> <text>           text + ⏎ (paste-style, like the phone)
+    ///   key <id> <keys…>           enter esc tab shift-tab space backspace up/down/left/right ctrl-<a-z> or a character
+    ///   read <id>                  the rendered screen, plain text
+    ///   status <id>                working | attention | idle | gone
+    ///   echo <id> <text>           print a line on the tab's screen (the overseer's log, no tty needed)
+    private func handleTabCommand(_ cmd: String) -> String {
+        let parts = cmd.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+        let verb = parts.first ?? ""
+        if verb == "open" || verb == "shell" {
+            let dir = ((parts.dropFirst().joined(separator: " ")) as NSString).expandingTildeInPath
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { return "error: no such directory" }
+            Projects.touch(dir)
+            let wc = frontWindow() ?? newWindow(withTab: false)
+            let tab = wc.addTab(TabOptions(cwd: dir, cmd: verb == "open" ? "claude" : nil,
+                                           title: (dir as NSString).lastPathComponent,
+                                           restoreCmd: verb == "open" ? "claude -c" : nil))
+            NSApp.activate(ignoringOtherApps: true)
+            return String(tab.id)
+        }
+        guard parts.count >= 2, let id = Int(parts[1]) else { return "error: usage" }
+        guard let tab = tabById[id] else { return verb == "status" ? "gone" : "error: no tab \(id)" }
+        let arg = parts.count > 2 ? parts[2] : ""
+        switch verb {
+        case "type":
+            tab.working = false; tab.attention = false; tabStateChanged(tab)   // like a keypress: stale "waiting" cleared
+            tab.view.send(txt: arg)
+            let view = tab.view
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { view.send(txt: "\r") }
+            return "ok"
+        case "key":   // one or more keys, space-separated, ~150 ms apart (menus need the gap)
+            let keys = ["enter": "\r", "esc": "\u{1b}", "tab": "\t", "shift-tab": "\u{1b}[Z", "space": " ",
+                        "backspace": "\u{7f}", "up": "\u{1b}[A", "down": "\u{1b}[B", "left": "\u{1b}[D", "right": "\u{1b}[C"]
+            var seqs: [String] = []
+            for k in arg.split(separator: " ").map(String.init) {
+                if let s = keys[k] { seqs.append(s) }
+                else if k.hasPrefix("ctrl-"), k.count == 6, let a = k.last?.asciiValue, a >= 97, a <= 122 { seqs.append(String(UnicodeScalar(a - 96))) }
+                else if k.count == 1 { seqs.append(k) }
+                else { return "error: unknown key \(k)" }
+            }
+            tab.working = false; tab.attention = false; tabStateChanged(tab)
+            let view = tab.view
+            for (i, seq) in seqs.enumerated() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15 * Double(i)) { view.send(txt: seq) } }
+            return "ok"
+        case "read": return tab.view.plainScreen()
+        case "echo": tab.view.feed(text: "\r\n" + arg); return "ok"
+        case "status": return tab.working ? "working" : tab.attention ? "attention" : "idle"
+        default: return "error: unknown command"
+        }
     }
 
     /// Ported from the Electron main process: working events animate; a Stop

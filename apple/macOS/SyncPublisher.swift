@@ -3,7 +3,8 @@ import CloudKit
 import KnifeKit
 
 /// Mac side of the iOS mirror: publishes Tab records (coalesced), consumes
-/// Input records, creates Alert records for push notifications.
+/// Input records, creates Alert records for push notifications, and runs the
+/// phone's job requests. One Mac is the executor; run Knife on one Mac.
 @MainActor
 final class SyncPublisher {
     let cloud = CloudSync(role: "mac")
@@ -43,6 +44,10 @@ final class SyncPublisher {
         do {
             try await cloud.ensureZone()
             try await cloud.clearStaleTabs()
+            if !UserDefaults.standard.bool(forKey: "knife.legacyProjectsGone") {
+                try await cloud.deleteLegacyProjectsRecord()
+                UserDefaults.standard.set(true, forKey: "knife.legacyProjectsGone")
+            }
             // one-time: re-walk the whole zone so leaked Alert records get purged
             if !UserDefaults.standard.bool(forKey: "knife.purgedAlerts") {
                 cloud.resetChangeToken()
@@ -63,16 +68,18 @@ final class SyncPublisher {
         await publishProjectsIfChanged()
     }
 
-    // ─── Recent projects list (for the iOS "open a project" screen) ───
+    // ─── Project manifest: this machine's slice ───
 
     private var lastProjectsJSON: Data?
     func publishProjectsIfChanged() async {
         guard enabled else { return }
-        let refs = Projects.list().map { ProjectRef(name: $0.name, path: $0.path) }
+        let refs = Manifest.localRefs()
+        Manifest.write(local: refs)
         guard let json = try? JSONEncoder().encode(refs), json != lastProjectsJSON else { return }
-        do { try await cloud.saveProjects(refs); lastProjectsJSON = json }
+        do { try await cloud.saveProjects(refs, machine: Manifest.machine); lastProjectsJSON = json }
         catch { NSLog("knife sync: projects publish failed (will retry): \(error)") }
     }
+
 
     // ─── Publishing ───
 
@@ -147,6 +154,12 @@ final class SyncPublisher {
         consuming = true
         defer { consuming = false }
         guard let delta = try? await cloud.fetchChanges() else { return } // failure already logged by CloudSync
+        // other machines' manifest slices → merged file for the job runner
+        if !delta.projects.isEmpty || !delta.deletedProjectRecordNames.isEmpty {
+            for (name, refs) in delta.projects { Manifest.remoteLists[name] = refs }
+            for name in delta.deletedProjectRecordNames { Manifest.remoteLists.removeValue(forKey: name) }
+            Manifest.write(local: Manifest.localRefs())
+        }
         if !delta.garbage.isEmpty { Task { try? await cloud.deleteRecords(delta.garbage) } }
         guard !delta.inputs.isEmpty || !delta.opens.isEmpty || !delta.closes.isEmpty || !delta.seens.isEmpty
         else { return }
@@ -168,11 +181,14 @@ final class SyncPublisher {
         // phone asked to open a project → new tab running claude, mirrored back
         // "codex:<path>" picks Codex CLI — the Open record can't grow a cmd
         // field without a Production CloudKit schema deploy, so it rides in path
+        // "job:<text>" is a request to route + run (see knife-job.sh)
         for open in delta.opens where !open.path.isEmpty {
-            if open.path.hasPrefix("codex:") {
-                AppModel.shared.dispatchOpen(String(open.path.dropFirst(6)), cmd: "codex")
+            if open.path.hasPrefix(CloudSync.jobPrefix) {
+                AppModel.shared.dispatchJob(String(open.path.dropFirst(CloudSync.jobPrefix.count)))
+            } else if open.path.hasPrefix("codex:") {
+                AppModel.shared.openProject(String(open.path.dropFirst(6)), cmd: "codex")
             } else {
-                AppModel.shared.dispatchOpen(open.path, cmd: "claude")
+                AppModel.shared.openProject(open.path, cmd: "claude")
             }
         }
         // phone asked to close a tab

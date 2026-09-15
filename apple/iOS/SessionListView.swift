@@ -11,6 +11,7 @@ struct SessionListView: View {
     /// so scrolling never decodes a transcript.
     @State private var snippets: [String: String] = [:]
     @AppStorage("knife.pushAlerts") private var pushAlerts = false
+    @State private var request = ""
 
     private var q: String { query.trimmingCharacters(in: .whitespaces).lowercased() }
 
@@ -52,6 +53,25 @@ struct SessionListView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                Section {
+                    HStack(alignment: .bottom, spacing: 8) {
+                        TextField("dictate or type a request…", text: $request, axis: .vertical)
+                            .font(mono(13)).lineLimit(1...6)
+                            .onSubmit { store.postJob(request); request = "" }
+                        if store.pendingJob {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button { store.postJob(request); request = "" } label: {
+                                Text("send").font(mono(11, bold: true)).foregroundStyle(request.isEmpty ? .secondary : theme.accent.color)
+                            }
+                            .buttonStyle(.plain).disabled(request.isEmpty)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                    .listRowSeparator(.hidden)
+                } header: {
+                    Text("ask — routed to a project, run on your Mac").font(ui(12)).foregroundStyle(.secondary)
+                }
                 if store.tabs.isEmpty {
                     Section {
                         VStack(alignment: .leading, spacing: 6) {
