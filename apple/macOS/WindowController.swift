@@ -15,6 +15,12 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
 
     var activeTab: TabModel? { tabs.first { $0.id == activeId } }
 
+    /// Tabs in the order the sidebar draws them: by group, manual order within a
+    /// group. ⌘1–9, ⌘⇧[ ] and the tab ⌘W lands on follow this, not `tabs` itself.
+    var sidebarOrder: [TabModel] {
+        SidebarGroup.allCases.flatMap { g in tabs.filter { $0.group == g } }
+    }
+
     convenience init(bounds: NSRect?) {
         let rect = bounds ?? NSRect(x: 0, y: 0, width: 1100, height: 700)
         let win = NSWindow(contentRect: rect,
@@ -57,6 +63,8 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
 
     func closeTab(_ id: Int, keepAlive: Bool = false) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let shown = sidebarOrder
+        let pos = shown.firstIndex { $0.id == id } ?? 0
         let tab = tabs.remove(at: idx)
         statusWatch.removeValue(forKey: id)
         if !keepAlive {
@@ -72,7 +80,11 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
             }
             return
         }
-        if activeId == id { activate(tabs[min(idx, tabs.count - 1)].id) }
+        if activeId == id {
+            // The row below it in the sidebar takes over (the one above, if it was last).
+            let rest = shown.filter { $0.id != id }
+            activate(rest[min(pos, rest.count - 1)].id)
+        }
         AppModel.shared.saveSessionSoon()
     }
 
@@ -85,8 +97,9 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
     }
 
     func cycle(_ dir: Int) {
-        guard let cur = activeId, let i = tabs.firstIndex(where: { $0.id == cur }), !tabs.isEmpty else { return }
-        activate(tabs[(i + dir + tabs.count) % tabs.count].id)
+        let order = sidebarOrder
+        guard let cur = activeId, let i = order.firstIndex(where: { $0.id == cur }) else { return }
+        activate(order[(i + dir + order.count) % order.count].id)
     }
 
     func windowWillClose(_ notification: Notification) {

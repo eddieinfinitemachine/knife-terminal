@@ -149,8 +149,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleBoard() { front?.showBoard.toggle() }
     @objc private func jumpToTab(_ sender: NSMenuItem) {
         guard let wc = front else { return }
-        let i = sender.tag - 1
-        if i < wc.tabs.count { wc.activate(wc.tabs[i].id) }
+        let order = wc.sidebarOrder, i = sender.tag - 1
+        if i < order.count { wc.activate(order[i].id) }
     }
     @objc private func nextTab() { front?.cycle(1) }
     @objc private func prevTab() { front?.cycle(-1) }
