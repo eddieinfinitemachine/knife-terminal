@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 extension Notification.Name {
     static let knifeFocusSearch = Notification.Name("knife.focusSearch")
+    static let knifeChatFind = Notification.Name("knife.chatFind") // object: window controller; userInfo["action"]: NSTextFinder.Action
     static let knifeToggleSidebar = Notification.Name("knife.toggleSidebar")
 }
 
@@ -13,11 +14,18 @@ func ui(_ size: CGFloat, bold: Bool = false) -> Font {
     Font.custom(bold ? "HelveticaNowText-Medium" : "HelveticaNowText-Regular", size: size)
 }
 
+// Upstream's chat view and git panel are set in Space Mono.
+func mono(_ size: CGFloat, bold: Bool = false) -> Font {
+    Font.custom(bold ? "Space Mono Bold" : "Space Mono", size: size)
+}
+
 struct ContentView: View {
     @ObservedObject var controller: KnifeWindowController
     @ObservedObject var theme = AppModel.shared.theme
     @AppStorage("sidebarCollapsed") private var collapsed = false
     @AppStorage("sideWidth") private var sideWidth: Double = 220
+    @AppStorage("gitPanel") private var gitPanel = false
+    @AppStorage("chatView") private var chatView = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -40,12 +48,20 @@ struct ContentView: View {
                                 }
                         )
                 }
-                if controller.showBoard {
-                    BoardView(controller: controller)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    TerminalPane(controller: controller)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Group {
+                    if controller.showBoard {
+                        BoardView(controller: controller)
+                    } else if chatView, let tab = controller.activeTab {
+                        ChatPane(controller: controller, tab: tab)
+                            .id(tab.id) // fresh state per tab: echoes, opened runs, find never carry over
+                    } else {
+                        TerminalPane(controller: controller)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if gitPanel {
+                    Rectangle().fill(Color.primary.opacity(0.12)).frame(width: 1)
+                    GitPanel(controller: controller).frame(width: 280)
                 }
             }
             FooterBar(controller: controller)
@@ -209,6 +225,7 @@ struct SidebarView: View {
                         }
                         .buttonStyle(.plain)
                         .help("on another Mac — opens by cloning it here")
+                        .contextMenu { projectMenu(p, local: false) }
                     }
 
                     JobBox()
@@ -244,6 +261,13 @@ struct SidebarView: View {
         } message: {
             Text(renaming.map { ($0.path as NSString).abbreviatingWithTildeInPath } ?? "")
         }
+    }
+
+    /// Right-click a project that only exists on another Mac: its repo's web page (from the
+    /// manifest's remote). Local rows get the same links inside ProjectRow's own menu.
+    @ViewBuilder
+    private func projectMenu(_ p: Project, local: Bool) -> some View {
+        ProjectRow.links(p, local: local)
     }
 
     private var filtered: [Project] { filter(projects) }
@@ -482,8 +506,25 @@ private struct ProjectRow: View {
             Button("move to active") { move(.active) }
             Button("move to dormant") { move(.dormant) }
             Button("move to archived") { move(.archived) }
+            Divider()
+            Self.links(project, local: true)
         }
         .help(project.path)
+    }
+
+    /// Its folder in Finder, its repo's web page (from the git remote; for another Mac's
+    /// project, the manifest's).
+    @ViewBuilder
+    static func links(_ p: Project, local: Bool) -> some View {
+        if local {
+            Button("Open Folder in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath: p.path)) }
+        }
+        let remote = local ? Manifest.remote(of: p.path) : Manifest.merged.first { $0.path == p.path }?.remote
+        if let url = remote.flatMap(ProjectRef.webURL(forRemote:)) {
+            Button("Open Repo Page (\(url.host ?? "web"))") { NSWorkspace.shared.open(url) }
+        } else {
+            Button("No Git Remote") {}.disabled(true)
+        }
     }
 }
 
@@ -595,36 +636,60 @@ private struct ProjectSectionDrop: DropDelegate {
 }
 
 // ─── Footer: spans the full window width, below sidebar + terminal ───
+// Bordered square buttons in groups — view · panels · find · context · setup; a toggle that's
+// on draws inverted. Tooltips carry the keyboard shortcut.
 
 struct FooterBar: View {
     @ObservedObject var controller: KnifeWindowController
     @ObservedObject var theme = AppModel.shared.theme
+    @AppStorage("sidebarCollapsed") private var sidebarCollapsed = false
+    @AppStorage("gitPanel") private var gitPanel = false
+    @AppStorage("chatView") private var chatView = false
     @State private var hooksOn = HooksInstaller.installed()
     @State private var ctxScope: String? = nil
 
     var body: some View {
         VStack(spacing: 0) {
             Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1)
-            HStack(spacing: 12) {
-                footBtn(theme.mode.rawValue) { theme.cycle() }
-                footBtn("board") { controller.showBoard.toggle() }
-                footBtn(hooksOn ? "alerts on" : "alerts off") {
+            HStack(spacing: 8) {
+                HStack(spacing: -1) { // segmented: shared borders
+                    btn("terminal", on: !chatView && !controller.showBoard, help: "terminal view  ⌘⌥C") { controller.showBoard = false; chatView = false }
+                    btn("chat", on: chatView && !controller.showBoard, help: "chat view  ⌘⌥C") { controller.showBoard = false; chatView = true }
+                    btn("board", on: controller.showBoard, help: "session board  ⌘⇧B") { controller.showBoard = true }
+                }
+                sep
+                btn("sidebar", on: !sidebarCollapsed, help: "sidebar  ⌘B") { sidebarCollapsed.toggle() }
+                btn("git", on: gitPanel, help: "git panel  ⌘⌥B") { gitPanel.toggle() }
+                sep
+                btn("find", help: "find in this tab  ⌘F · next ⌘G") {
+                    let item = NSMenuItem()
+                    item.tag = NSTextFinder.Action.showFindInterface.rawValue
+                    (NSApp.delegate as? AppDelegate)?.find(item)
+                }
+                sep
+                btn("global ctx", on: ctxScope == "global", help: "context shared by every session") {
+                    ctxScope = ctxScope == "global" ? nil : "global"
+                }
+                .popover(isPresented: Binding(get: { ctxScope == "global" }, set: { if !$0 { ctxScope = nil } })) {
+                    ContextPanel(scope: "global", cwd: nil)
+                }
+                btn("tab ctx", on: ctxScope == "session", help: "context for this tab's session") {
+                    ctxScope = ctxScope == "session" ? nil : "session"
+                }
+                .popover(isPresented: Binding(get: { ctxScope == "session" }, set: { if !$0 { ctxScope = nil } })) {
+                    ContextPanel(scope: "session", cwd: controller.activeTab?.currentCwd)
+                }
+                sep
+                btn("theme: " + theme.mode.rawValue, help: "cycle auto · light · dark") { theme.cycle() }
+                btn(hooksOn ? "alerts on" : "alerts off", on: hooksOn, help: "Claude Code hooks for working/attention alerts") {
                     _ = HooksInstaller.install(); hooksOn = HooksInstaller.installed()
                 }
-                footBtn("set default") { DefaultTerminal.register() }
-                footBtn("global ctx") { ctxScope = ctxScope == "global" ? nil : "global" }
-                    .popover(isPresented: Binding(get: { ctxScope == "global" }, set: { if !$0 { ctxScope = nil } })) {
-                        ContextPanel(scope: "global", cwd: nil)
-                    }
-                footBtn("tab ctx") { ctxScope = ctxScope == "session" ? nil : "session" }
-                    .popover(isPresented: Binding(get: { ctxScope == "session" }, set: { if !$0 { ctxScope = nil } })) {
-                        ContextPanel(scope: "session", cwd: controller.activeTab?.currentCwd)
-                    }
-                Spacer()
+                btn("set default", help: "make Knife the default terminal") { DefaultTerminal.register() }
+                Spacer(minLength: 8)
                 Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
-                    .font(ui(9)).foregroundStyle(.tertiary)
+                    .font(ui(9)).foregroundStyle(.tertiary).fixedSize()
             }
-            .padding(.horizontal, 10).padding(.vertical, 6)
+            .padding(.horizontal, 10).padding(.vertical, 5)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { n in
             guard (n.object as? NSWindow) === controller.window else { return }
@@ -632,11 +697,42 @@ struct FooterBar: View {
         }
     }
 
-    private func footBtn(_ label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label).font(ui(10)).foregroundStyle(.secondary)
+    private var sep: some View { Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14) }
+
+    private func btn(_ label: String, on: Bool = false, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Text(label) }
+            .buttonStyle(FootButtonStyle(on: on, paper: Color(nsColor: theme.nsColor(theme.current.background))))
+            .help(help)
+    }
+}
+
+/// Square, 1px-bordered, chrome type; hover tints, press darkens, `on` inverts (ink fill, paper text).
+/// `wrap` lets a long label (the chat's question options) wrap instead of staying one line.
+struct FootButtonStyle: ButtonStyle {
+    var on = false
+    let paper: Color
+    var wrap = false
+
+    func makeBody(configuration: Configuration) -> some View { Face(configuration: configuration, on: on, paper: paper, wrap: wrap) }
+
+    private struct Face: View {
+        let configuration: Configuration
+        let on: Bool
+        let paper: Color
+        let wrap: Bool
+        @State private var hover = false
+
+        var body: some View {
+            configuration.label
+                .font(ui(10)).lineLimit(wrap ? nil : 1).fixedSize(horizontal: !wrap, vertical: true)
+                .foregroundStyle(on ? paper : Color.primary)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(on ? Color.primary.opacity(configuration.isPressed ? 0.7 : 0.9)
+                               : Color.primary.opacity(configuration.isPressed ? 0.16 : hover ? 0.07 : 0))
+                .overlay(Rectangle().stroke(Color.primary.opacity(on ? 0.9 : 0.35), lineWidth: 1))
+                .contentShape(Rectangle())
+                .onHover { hover = $0 }
         }
-        .buttonStyle(.plain)
     }
 }
 

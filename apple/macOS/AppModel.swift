@@ -42,6 +42,7 @@ final class AppModel: ObservableObject {
         napBlocker = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep, .automaticTerminationDisabled, .suddenTerminationDisabled],
             reason: "terminal sessions + socket server")
+        HooksInstaller.upgrade()
         restoreSession()
         saveTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
             Task { @MainActor in
@@ -236,17 +237,25 @@ final class AppModel: ObservableObject {
         guard let sp = trimmed.firstIndex(where: { $0 == " " || $0 == "\n" }) ?? (Int(trimmed) != nil ? trimmed.endIndex : nil),
               let id = Int(trimmed[trimmed.startIndex..<sp]) else { return nil }
         var type = "stop"
+        var hook: [String: Any] = [:]
         let rest = sp < trimmed.endIndex ? String(trimmed[trimmed.index(after: sp)...]) : ""
         if let data = rest.data(using: .utf8),
            let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            hook = j
             type = (j["notification_type"] as? String) ?? (j["hook_event_name"] as? String) ?? type
-            // remember which conversation lives in this tab so a relaunch can --resume it
-            if let tab = tabById[id], let sid = j["session_id"] as? String, !sid.isEmpty {
+        }
+        if let tab = tabById[id] { // this tab's own transcript, so its chat never shows a sibling tab's session
+            if type == "SessionEnd" { tab.transcriptPath = nil }
+            else if let p = hook["transcript_path"] as? String, !p.isEmpty { tab.transcriptPath = p }
+            // remember which conversation lives in this tab so a relaunch can --resume it; any tab,
+            // even a plain shell that ran `claude` — restoreCommand checks claude is still running
+            if let sid = hook["session_id"] as? String, sid.range(of: "^[A-Za-z0-9-]+$", options: .regularExpression) != nil {
                 let next: String? = type == "SessionEnd" ? nil : sid
-                if tab.claudeSessionId != next { tab.claudeSessionId = next; saveSessionSoon() }
+                if tab.sessionId != next { tab.sessionId = next; saveSessionSoon() }
             }
         }
-        attention(id: id, type: type)
+        if type == "SessionStart" { return nil } // hooked only to learn the new transcript (/clear, resume)
+        attention(id: id, type: type, hook: hook)
         return nil
     }
 
@@ -277,10 +286,8 @@ final class AppModel: ObservableObject {
         let arg = parts.count > 2 ? parts[2] : ""
         switch verb {
         case "type":
-            tab.working = false; tab.attention = false; tabStateChanged(tab)   // like a keypress: stale "waiting" cleared
-            tab.view.send(txt: arg)
-            let view = tab.view
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { view.send(txt: "\r") }
+            tab.working = false; tab.attention = false; tab.limited = false; tabStateChanged(tab)   // like a keypress: stale "waiting" cleared
+            tab.view.typeLine(arg)
             return "ok"
         case "key":   // one or more keys, space-separated, ~150 ms apart (menus need the gap)
             let keys = ["enter": "\r", "esc": "\u{1b}", "tab": "\t", "shift-tab": "\u{1b}[Z", "space": " ",
@@ -292,22 +299,24 @@ final class AppModel: ObservableObject {
                 else if k.count == 1 { seqs.append(k) }
                 else { return "error: unknown key \(k)" }
             }
-            tab.working = false; tab.attention = false; tabStateChanged(tab)
+            tab.working = false; tab.attention = false; tab.limited = false; tabStateChanged(tab)
             let view = tab.view
             for (i, seq) in seqs.enumerated() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15 * Double(i)) { view.send(txt: seq) } }
             return "ok"
         case "read": return tab.view.plainScreen()
         case "echo": tab.view.feed(text: "\r\n" + arg); return "ok"
-        case "status": return tab.working ? "working" : tab.attention ? "attention" : "idle"
+        case "status": return tab.limited ? "limit" : tab.working ? "working" : tab.attention ? "attention" : "idle"
         default: return "error: unknown command"
         }
     }
 
     /// Ported from the Electron main process: working events animate; a Stop
     /// only chimes when no sub-agents are live, after a short quiet window.
-    private func attention(id: Int, type: String) {
+    private func attention(id: Int, type: String, hook: [String: Any] = [:]) {
         let tab = tabById[id]
         tab?.lastActivity = Date()
+        if type == "StopFailure" { tab?.limited = hook["error"] as? String == "rate_limit" }
+        else if type != "idle_prompt" { tab?.limited = false }   // the idle nag after it is no new turn
         if Self.workingEvents.contains(type) {
             pendingStop[id]?.cancel(); pendingStop.removeValue(forKey: id)
             switch type {
@@ -338,6 +347,7 @@ final class AppModel: ObservableObject {
         }
         pendingStop[id]?.cancel(); pendingStop.removeValue(forKey: id)
         if type == "Stop" {
+            tab?.lastReply = hook["last_assistant_message"] as? String
             mainDone.insert(id)
             if (agents[id] ?? 0) > 0 { return } // background agents still running: finish on last SubagentStop
             scheduleStopFinish(id: id)
@@ -350,7 +360,9 @@ final class AppModel: ObservableObject {
             markAttention(tab, fromBell: false)
         }
         chime()
-        publishAlert(id: id, type: type)
+        // StopFailure: an API error ended the turn instead of a Stop (rate_limit, overloaded, …)
+        let failure = (hook["error"] as? String).map { $0 == "rate_limit" ? "hit the usage limit" : "stopped on an API error (\($0))" }
+        publishAlert(id: id, type: type, detail: type == "StopFailure" ? failure : hook["message"] as? String)
     }
 
     /// Everything is done (main agent stopped, no live subagents): after the
@@ -367,7 +379,7 @@ final class AppModel: ObservableObject {
                 self.tabStateChanged(tab)
             }
             self.chime()
-            self.publishAlert(id: id, type: "Stop")
+            self.publishAlert(id: id, type: "Stop", detail: self.tabById[id]?.lastReply)
         }
         pendingStop[id] = work
         DispatchQueue.main.asyncAfter(deadline: .now() + stopQuiet, execute: work)
@@ -394,10 +406,15 @@ final class AppModel: ObservableObject {
         NSSound(contentsOfFile: "/System/Library/Sounds/\(name).aiff", byReference: true)?.play()
     }
 
-    private func publishAlert(id: Int, type: String) {
+    /// The push says what the tab wants: the Notification's text ("Claude needs your permission to
+    /// use Bash"), else the last paragraph of claude's reply at Stop, cut to 200 characters.
+    private func publishAlert(id: Int, type: String, detail: String? = nil) {
         guard let tab = tabById[id] else { return }
-        let msg = type == "Stop" ? "\(tab.title) — ready for input" : "\(tab.title) — needs attention"
-        sync?.publishAlert(tabTitle: tab.title, message: msg)
+        let last = detail?.components(separatedBy: "\n\n").last(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+        var gist = (last ?? "").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        if gist.count > 200 { gist = String(gist.prefix(199)) + "…" }
+        let msg = gist.isEmpty ? (type == "Stop" ? "ready for input" : "needs attention") : gist
+        sync?.publishAlert(tabTitle: tab.title, message: "\(tab.title) — \(msg)")
     }
 
     func tabStateChanged(_ tab: TabModel) {
@@ -459,7 +476,7 @@ final class AppModel: ObservableObject {
     /// cwd; anything else keeps whatever it was opened with.
     static func restoreCommand(for t: TabModel) -> String? {
         guard t.claudeRunning else { return t.opts.restoreCmd }
-        if let sid = t.claudeSessionId { return "claude --resume \(sid)" }
+        if let sid = t.sessionId { return "claude --resume \(sid)" }
         return t.opts.restoreCmd ?? "claude -c"
     }
 

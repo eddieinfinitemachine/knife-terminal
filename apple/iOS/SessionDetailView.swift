@@ -19,6 +19,17 @@ struct SessionDetailView: View {
 
     private var tab: MirroredTab? { store.tabs.first { $0.id == tabRecordName } }
     private var messages: [ChatMessage] { tab.flatMap { ChatTranscript.decode($0.chat) } ?? [] }
+    /// Sent from the chat composer, not yet back from the Mac: shown greyed at once. Dropped
+    /// once the mirrored transcript carries the text (or after 30s — e.g. a prompt answer).
+    @State private var echoes: [(text: String, sent: Date)] = []
+    private var shown: [ChatMessage] {
+        let msgs = messages
+        let recent = msgs.suffix(8).filter { $0.kind == .user }.map(\.text)
+        let pending = echoes.filter { $0.sent.timeIntervalSinceNow > -30 && !recent.contains($0.text) }
+        return msgs + pending.enumerated().map { i, e in
+            ChatMessage(id: "echo-\(i)-\(e.sent.timeIntervalSince1970)", kind: .user, text: e.text, detail: "sending")
+        }
+    }
 
     var body: some View {
         Group {
@@ -152,7 +163,8 @@ struct SessionDetailView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(messages) { m in messageRow(m) }
+                        ForEach(shown) { m in messageRow(m) }
+                        if let p = screenPrompt(tab) { promptCard(p, tab) }
                         if tab.working { workingRow }
                         Color.clear.frame(height: 1).id("chat-bottom")
                     }
@@ -161,8 +173,10 @@ struct SessionDetailView: View {
                 .background(theme.background.color)
                 .scrollDismissesKeyboard(.interactively)
                 .defaultScrollAnchor(.bottom)
-                .onChange(of: messages.last?.id ?? "") {
-                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("chat-bottom", anchor: .bottom) }
+                .onChange(of: shown.last?.id ?? "") { // next runloop: the new row is laid out by then
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("chat-bottom", anchor: .bottom) }
+                    }
                 }
                 .onChange(of: composing) { _, focused in
                     if focused { proxy.scrollTo("chat-bottom", anchor: .bottom) }
@@ -176,13 +190,18 @@ struct SessionDetailView: View {
     private func messageRow(_ m: ChatMessage) -> some View {
         switch m.kind {
         case .user:
+            // detail "sending" (local echo) / "queued" (waiting on Claude's turn): greyed, tagged
             HStack {
                 Spacer(minLength: 48)
-                Text(m.text)
-                    .font(ui(15))
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(RoundedRectangle(cornerRadius: 16).fill(theme.accent.color.opacity(0.22)))
-                    .textSelection(.enabled)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(m.text)
+                        .font(ui(15))
+                        .foregroundStyle(m.detail == nil ? .primary : .secondary)
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 16).fill(theme.accent.color.opacity(m.detail == nil ? 0.22 : 0.1)))
+                        .textSelection(.enabled)
+                    if let d = m.detail { Text(d).font(ui(11)).foregroundStyle(.tertiary) }
+                }
             }
         case .assistant:
             Text(markdown(m.text))
@@ -190,11 +209,16 @@ struct SessionDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
         case .tool:
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)).padding(.top, 3)
-                Text(m.text).font(mono(12))
-                    .lineLimit(expandedTools.contains(m.id) ? nil : 2)  // tap for the rest
-                    .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)).padding(.top, 3)
+                    Text(m.text).font(mono(12))
+                        .lineLimit(expandedTools.contains(m.id) ? nil : 2)  // tap for the rest
+                        .textSelection(.enabled)
+                }
+                if let d = m.detail, expandedTools.contains(m.id) { // the full input rides along when opened
+                    Text(d).font(mono(11)).padding(.leading, 15).textSelection(.enabled)
+                }
             }
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -203,6 +227,34 @@ struct SessionDetailView: View {
                 if expandedTools.contains(m.id) { expandedTools.remove(m.id) } else { expandedTools.insert(m.id) }
             }
         }
+    }
+
+    /// A numbered menu on the mirrored screen — a permission prompt, or a question's picker —
+    /// answered from chat: a digit picks (Claude Code 2.1.278).
+    private func screenPrompt(_ tab: MirroredTab) -> ScreenPrompt? {
+        guard let screen = StyledScreen.decode(tab.styled) else { return nil }
+        return ScreenPrompt.parse(screen.lines.map { $0.map(\.t).joined() }.joined(separator: "\n"))
+    }
+
+    private func promptCard(_ p: ScreenPrompt, _ tab: MirroredTab) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let t = p.title { Text(t).font(ui(13, bold: true)).foregroundStyle(theme.attention.color) }
+            ForEach(p.body, id: \.self) { Text($0).font(ui(14)) }
+            ForEach(p.options.indices, id: \.self) { i in
+                Button { store.send("\(i + 1)", to: tab.tabId) } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("\(i + 1)").font(ui(14, bold: true))
+                        Text(p.options[i]).font(ui(14)).multilineTextAlignment(.leading)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 9)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(theme.accent.color.opacity(0.18)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(theme.attention.color, lineWidth: 1))
     }
 
     private var workingRow: some View {
@@ -291,6 +343,8 @@ struct SessionDetailView: View {
 
     private func submit(_ tab: MirroredTab) {
         store.send(draft + "\r", to: tab.tabId)
+        let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !showTerminal, !t.isEmpty { echoes.removeAll { $0.sent.timeIntervalSinceNow < -30 }; echoes.append((t, Date())) }
         draft = ""
     }
 }
@@ -303,42 +357,6 @@ struct SessionDetailView: View {
 
 private func uiColor(_ c: TermTheme.RGB, alpha: CGFloat = 1) -> UIColor {
     UIColor(red: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: alpha)
-}
-
-// The Mac's statusline draws usage-limit bars like "5h ████░░░░░░ 42% (2h30m)"
-// in the terminal footer. They ride along in the mirrored screen, so the phone
-// can lift them back out and render native progress bars.
-struct UsageBar: Identifiable {
-    let label: String
-    let pct: Int
-    let reset: String?
-    var id: String { label }
-
-    var title: String {
-        switch label {
-        case "5h": return "session · 5 hour window"
-        case "wk": return "week · all models"
-        default: return "week · \(label)"
-        }
-    }
-
-    static func parse(_ styled: Data) -> [UsageBar] {
-        guard let screen = StyledScreen.decode(styled) else { return [] }
-        let pattern = /(\S+) ([█░]{10}) (\d{1,3})%(?: \(([^)]+)\))?/
-        var byLabel: [String: UsageBar] = [:]
-        var order: [String] = []
-        for line in screen.lines {
-            let text = line.map(\.t).joined()
-            for m in text.matches(of: pattern) {
-                let label = String(m.1)
-                let bar = UsageBar(label: label, pct: min(100, Int(m.3) ?? 0),
-                                   reset: m.4.map(String.init))
-                if byLabel[label] == nil { order.append(label) }
-                byLabel[label] = bar
-            }
-        }
-        return order.compactMap { byLabel[$0] }
-    }
 }
 
 struct MirrorTextView: UIViewRepresentable {

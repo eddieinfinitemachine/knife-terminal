@@ -7,6 +7,8 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
     @Published var tabs: [TabModel] = []
     @Published var activeId: Int?
     @Published var showBoard = false
+    var chatPanes = 0 // ChatPanes up (not their terminal fallback): a count, since tab switches overlap appear/disappear
+    var chatShowing: Bool { chatPanes > 0 } // ⌘F/⌘G go to the chat's find bar
     /// The untouched shell a fresh window opens with; replaced by the first real tab.
     var defaultTabId: Int?
     /// The sidebar groups tabs; a tab changing group has to re-render the list

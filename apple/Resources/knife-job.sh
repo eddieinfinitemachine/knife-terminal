@@ -50,12 +50,12 @@ tab() {
     key)    note "▶ key $1 $2"; printf 'tab key %s %s' "$1" "$2" | sock; echo ;;
     read)   printf 'tab read %s' "$1" | sock; echo ;;
     status) printf 'tab status %s' "$1" | sock; echo ;;
-    wait)   # until the tab wants input (attention), quits (idle 15 s), or the screen freezes while
+    wait)   # until the tab wants input (attention), hits a usage limit, quits (idle 15 s), or the screen freezes while
             # "working" for 45 s (a dialog no hook reports: trust prompt, menu, AskUserQuestion) → stalled
             local t=0 idle=0 same=0 st h last=""
             while [ $t -lt 1800 ]; do
               st=$(printf 'tab status %s' "$1" | sock)
-              case "$st" in attention|gone) break ;; idle) idle=$((idle+3)); [ $idle -ge 15 ] && break ;; *) idle=0 ;; esac
+              case "$st" in attention|limit|gone) break ;; idle) idle=$((idle+3)); [ $idle -ge 15 ] && break ;; *) idle=0 ;; esac
               h=$(printf 'tab read %s' "$1" | sock | md5); if [ "$h" = "$last" ]; then same=$((same+3)); else same=0; last=$h; fi
               [ $same -ge 45 ] && { st=stalled; break; }
               sleep 3; t=$((t+3))
@@ -170,7 +170,7 @@ run() {
   knife-tab type <id> <text>    type text into the tab and press enter (quote the text)
   knife-tab key <id> <keys…>    press keys in order: enter esc tab shift-tab space backspace up down left right ctrl-c ctrl-<x> or a single character
   knife-tab read <id>           the tab's current screen
-  knife-tab status <id>         working | attention (claude is waiting for input) | idle (nothing running) | gone
+  knife-tab status <id>         working | attention (claude is waiting for input) | limit (stopped on a usage limit) | idle (nothing running) | gone
   knife-tab wait <id>           block until the tab wants input, quits, or stalls (screen frozen 45 s: a dialog)
   knife-tab ask <id> <question> hand a decision to the owner: pushes the question to their phone and blocks until they answer in the tab
 
@@ -196,25 +196,54 @@ Do it like this:
    Repeat wait + read until claude is done and has pushed.
 4. When claude in the tab has finished and pushed, reply with three lines — the tab id, what changed (from what you read on screen), whether it was pushed — and then a last line that is exactly DONE. Leave the tab open.
 If you end a reply without DONE, you are paused: the runner waits until the tab next needs input or goes quiet, then resumes you with its status — so never promise to wait, just end the reply.
+The owner can talk to you at any time, before or after DONE: a resume that starts with 'The owner says:' is them. Do what they say (it overrides the request), using the same tabs, and report back the same way.
 Never run anything but knife-tab. Never close or kill the tab."
 
-  # The overseer's turns end whenever it stops calling tools; the runner is the
-  # scheduler: while its last reply isn't DONE and a tab it opened is busy, wait
-  # on that tab here, then resume the same session with the tab's new status.
-  : > "$JOB.tabs"
-  local report sid="" rounds=0 busy id st
-  report=$(overseer "$prompt"); printf '%s\n' "$report" | tee -a "$JOB.out"
-  until grep -qx 'DONE' <<<"$report" || [ $rounds -ge 40 ]; do   # ponytail: 40 naps cap a runaway overseer
-    busy=""
-    for id in $(cat "$JOB.tabs"); do case "$(tab status "$id")" in working|attention) busy=$id ;; esac; done
-    [ -n "$busy" ] || break
-    st=$(tab wait "$busy"); rounds=$((rounds+1))
-    report=$(overseer "Tab $busy is now $st. knife-tab read it and continue from step 3." "$sid"); printf '%s\n' "$report" | tee -a "$JOB.out"
-  done
+  drive "$prompt"
+}
 
-  summary=$(tail -c 2500 "$JOB.out")
-  say "done"
-  alert "$name — $summary"
+# The overseer's turns end whenever it stops calling tools; the runner is the
+# scheduler: while its last reply isn't DONE and a tab it opened is busy, wait
+# on that tab, then resume the same session with the tab's new status. Anything
+# the owner types into this tab meanwhile (Mac keyboard or the phone's composer)
+# is the overseer's next turn instead, and after DONE the tab stays open as a
+# chat with it. Uses $JOB, $name; $1 = the opening prompt.
+drive() {
+  : > "$JOB.tabs"
+  local report sid="" rounds=0 busy id st line w reported="" chat=""
+  [ -t 0 ] && chat=1   # a keyboard to chat from (not a pipe/self-check); closing the tab HUPs us, so no EOF handling
+  report=$(overseer "$1"); printf '%s\n' "$report" | tee -a "$JOB.out"
+  while :; do
+    busy=""
+    if ! grep -qx 'DONE' <<<"$report" && [ $rounds -lt 40 ]; then   # ponytail: 40 naps cap a runaway overseer
+      for id in $(cat "$JOB.tabs"); do case "$(tab status "$id")" in working|attention) busy=$id ;; esac; done
+    fi
+    if [ -z "$busy" ] && [ -z "$reported" ]; then
+      reported=1; alert "$name — $(tail -c 2500 "$JOB.out")"
+      say "done${chat:+ — type here to keep talking to the overseer}"
+    fi
+    [ -n "$busy" ] || [ -n "$chat" ] || return 0
+    w=""; [ -n "$busy" ] && { tab wait "$busy" > "$JOB.wait" & w=$!; }
+    line=""
+    while [ -n "$chat" ] && { [ -z "$w" ] || kill -0 "$w" 2>/dev/null; }; do
+      IFS= read -r -t 2 line && [ -n "$line" ] && break   # bash 3.2: timeout also returns 1, so no EOF test
+      line=""
+    done
+    if [ -n "$line" ]; then
+      [ -n "$w" ] && { kill "$w" 2>/dev/null; wait "$w" 2>/dev/null; }
+      report=$(overseer "The owner says: $line" "$sid")
+    else
+      wait "$w" 2>/dev/null; st=$(cat "$JOB.wait"); rounds=$((rounds+1))
+      if [ "$st" = limit ]; then   # the overseer runs on the same account — resuming it now fails too
+        reported=1; alert "$name — tab $busy hit the usage limit; paused${chat:+, type here to resume once it resets}"
+        say "paused — tab $busy hit the usage limit${chat:+; type here to resume once it resets}"
+        [ -n "$chat" ] || return 0
+        report=""; continue
+      fi
+      report=$(overseer "Tab $busy is now $st. knife-tab read it and continue from step 3." "$sid")
+    fi
+    printf '%s\n' "$report" | tee -a "$JOB.out"
+  done
 }
 
 # one overseer turn: $1 prompt, $2 session to resume (empty = new) → prints its reply, sets $sid

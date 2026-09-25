@@ -61,13 +61,13 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         let g = SidebarGroup.of(status, lastActivity: lastActivity, now: now)
         if g != group { group = g }
     }
+    var limited = false        // the turn ended on a usage limit (StopFailure rate_limit)
+    var sessionId: String?     // claude's session, from its hooks — restore resumes exactly this one
+    var transcriptPath: String? // the agent's live transcript, from its hooks — the chat view reads exactly this one
+    var lastReply: String?     // claude's last message at Stop, for the push
     var cols = 80
     var rows = 25
     var lastReportedCwd: String? // OSC 7, when the shell emits it
-    /// Claude Code session running in this tab, learned from hook payloads
-    /// (every hook carries `session_id`); cleared on SessionEnd.
-    var claudeSessionId: String?
-
     var shellPid: pid_t { view.process?.shellPid ?? 0 }
 
     /// Agent process alive under this tab's shell right now, if any.
@@ -204,10 +204,12 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         view.onUserInput = { [weak self] in
             guard let self else { return }
             self.lastActivity = Date()
+            self.limited = false
             if self.status != .working { self.status = .idle }
             if self.attention { self.attention = false; AppModel.shared.tabStateChanged(self) }
         }
         view.onInterrupt = { [weak self] in
+            self?.limited = false
             guard let self, self.working || self.status == .working else { return }
             self.working = false
             self.status = .idle

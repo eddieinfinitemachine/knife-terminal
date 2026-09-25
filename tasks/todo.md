@@ -141,3 +141,17 @@ Hook events on other sessions also reflowed the groups above "active" mid-press.
 - [x] Build + install
 - [ ] Hands-on by Eddie: open a ready tab, then click a row in active — highlight should be on
       the row under the pointer; move the pointer off the sidebar and the opened tab slides to active
+
+## 2026-09-25 — merge upstream v1.2.6–v1.2.30 (chat view, git panel, prompts, transcripts)
+
+- [x] Fetch origin (Che-Wei) — 25 commits, 28 files; 10 conflicting files
+- [x] Resolve: keep grouped sidebar/board/Helvetica chrome, take chat view + git panel + screen prompts + incremental transcript reader
+  - one session-id tracker: upstream's `TabModel.sessionId` (set from any hook, cleared on SessionEnd); my `restoreCommand` still checks claude is running before `--resume`
+  - `BoardView` + `SyncPublisher` read transcripts through upstream's `TranscriptReader.source/chat` (hook-reported path, sibling tabs excluded)
+  - footer: upstream's bordered buttons in `ui()`; `terminal | chat | board` is one segment
+  - project rows: upstream's Finder / repo-page links appended to my rename/star/move menu (`ProjectRow.links`)
+  - iOS: upstream's greyed echo + prompt card mapped onto `theme.accent/attention` (my fork dropped `knifeAccent`); tool detail shows when the row is expanded
+  - typing still doesn't clear `working` (my flap fix); it does clear `limited`
+- [x] `make mac` BUILD SUCCEEDED · `make ios` BUILD SUCCEEDED · KnifeKit `swift test` 9/9
+- [ ] Not run live (Claude runs inside Knife — Eddie relaunches): `make install-mac`, then check chat view ⌘⌥C, git panel ⌘⌥B, board segment, a permission prompt in chat, project right-click links
+- [ ] Decide: leave ChatPane/GitPanel in Space Mono (upstream) or move their chrome to `ui()` — left as upstream for now to keep future merges clean

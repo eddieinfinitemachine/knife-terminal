@@ -125,13 +125,12 @@ final class SyncPublisher {
                 defer { order += 1 }
                 guard ids.contains(tab.id) else { continue }
                 let cwd = tab.lastReportedCwd ?? tab.opts.cwd
-                let claudeSessionId = tab.claudeSessionId
                 snaps.append(TabSnapshot(tabId: tab.id, title: tab.title, emoji: tab.emoji,
                                          cwd: cwd, order: order,
                                          cols: tab.cols, rows: tab.rows,
                                          working: tab.working, attention: tab.attention,
                                          styled: tab.view.styledScreen(),
-                                         chat: TranscriptReader.chatData(forCwd: cwd, sessionId: claudeSessionId)))
+                                         chat: TranscriptReader.chatData(TranscriptReader.source(for: tab, cwd: cwd))))
                 lastFlush[tab.id] = Date()
             }
         }
@@ -165,15 +164,9 @@ final class SyncPublisher {
         else { return }
         for input in delta.inputs {
             guard let tab = AppModel.shared.tab(input.tabId) else { continue }
-            var text = input.data
+            let text = input.data
             if text.count > 1, text.hasSuffix("\r") {
-                // Text and Enter must not land in one chunk: TUIs (Claude Code)
-                // treat fast multi-char input as a paste and insert the CR as a
-                // newline instead of submitting. Send the CR separately, later.
-                text.removeLast()
-                tab.view.send(txt: text)
-                let view = tab.view
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { view.send(txt: "\r") }
+                tab.view.typeLine(String(text.dropLast()))   // composer text: typed, not pasted
             } else {
                 tab.view.send(txt: text)
             }
