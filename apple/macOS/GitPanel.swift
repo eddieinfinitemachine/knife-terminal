@@ -60,7 +60,7 @@ struct GitPanel: View {
 
     private func section(_ title: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1).padding(.top, 6)
+            Rectangle().fill(Color.rule).frame(height: 1).padding(.top, 6)
             Text(title).font(mono(10)).foregroundStyle(.secondary)
         }
     }

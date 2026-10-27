@@ -165,7 +165,6 @@ final class PromptRails: ObservableObject {
 struct PromptRail: View {
     @ObservedObject var controller: KnifeWindowController
     @ObservedObject private var rails = PromptRails.shared
-    @ObservedObject private var theme = AppModel.shared.theme
     @State private var frozen: [RailPrompt]? // the list as it stood when the pointer came on: ticks hold still under it
     @State private var hovered: Int?
     @State private var shown: Int?           // the card up: the tick the pointer settled on
@@ -173,7 +172,7 @@ struct PromptRail: View {
     @State private var settling: Task<Void, Never>?
 
     static let width: CGFloat = 12
-    private static let inset: (top: CGFloat, bottom: CGFloat) = (36, 12) // clear of the titlebar
+    private static let inset: (top: CGFloat, bottom: CGFloat) = (12, 12) // the header above keeps it clear of the titlebar
 
     var body: some View {
         let tab = controller.activeTab
@@ -210,7 +209,7 @@ struct PromptRail: View {
             VStack(spacing: 0) {
                 ForEach(first..<list.count, id: \.self) { i in
                     let on = i == hovered || list[i].id == here
-                    Rectangle().fill(Color.primary.opacity(on ? 0.9 : 0.35))
+                    Rectangle().fill(on ? Color.ink : Color.inkFaint)
                         .frame(width: on ? 9 : 5, height: 1)
                         .padding(.trailing, 2)
                         .frame(width: Self.width, height: h, alignment: .trailing)
@@ -247,13 +246,13 @@ struct PromptRail: View {
             let note = miss?.prompt == p.id ? miss?.text : nil
             let center = (CGFloat(k - first) + 0.5) * h
             VStack(alignment: .leading, spacing: 4) {
-                Text(Pile.firstLine(p.text)).font(ui(12)).lineLimit(1).truncationMode(.tail)
-                Text(note ?? (p.reply.isEmpty ? "…" : p.reply)).font(ui(11)).foregroundStyle(.secondary).lineLimit(3)
+                Text(Pile.firstLine(p.text)).font(ui(12)).foregroundStyle(Color.ink).lineLimit(1).truncationMode(.tail)
+                Text(note ?? (p.reply.isEmpty ? "…" : p.reply)).font(ui(11)).foregroundStyle(Color.inkFaint).lineLimit(3)
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
             .frame(width: 320, alignment: .leading)
-            .background(Color(nsColor: theme.nsColor(theme.current.background)))
-            .overlay(Rectangle().stroke(Color.primary.opacity(0.12), lineWidth: 1))
+            .background(Color.paper)
+            .overlay(Rectangle().stroke(Color.rule, lineWidth: 1))
             .alignmentGuide(.top) { d in -min(max(center - d.height / 2, Self.inset.top - top), height - top - 8 - d.height) }
             .offset(x: -(Self.width + 4))
             .allowsHitTesting(false)

@@ -558,7 +558,7 @@ final class KnifeTermView: LocalProcessTerminalView {
             linkLayer.zPosition = 10
             layer?.addSublayer(linkLayer)
         }
-        linkLayer.strokeColor = AppModel.shared.theme.accent.withAlphaComponent(0.9).cgColor
+        linkLayer.strokeColor = Tone.ink.ns(dark: AppModel.shared.theme.isDark).withAlphaComponent(0.9).cgColor
         let path = CGMutablePath()
         let (cellW, cellH) = cellSize()
         for link in screenLinks {
