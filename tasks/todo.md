@@ -166,3 +166,20 @@ First pass landed on the project list (lower sidebar) — Eddie: "i relaunched i
 - [x] Persisted in session.json (context, contextPinned, fixed) so restored tabs keep their label until Claude re-titles them
 - [x] Build + `make install-mac` succeeded
 - [ ] Hands-on QA after relaunch: a project tab running Claude shows `name | summary` once Claude titles it; double-click opens the alert on the row clicked; typed context survives a relaunch
+
+## Zach's features → Swift Knife (2026-10-27)
+
+Source: zachcooperdesigns/knife-terminal (remote `zach`), an Electron app in `desktop/` (Windows + a Mac DMG
+from GitHub Actions). Its code is reference only — nothing from `desktop/` is merged. Eddie picked three
+features to rebuild in the Swift app; the rest (prompt rail, typed-input selection/undo, Ctrl+V screenshot
+paste, auto-trust, project folders, text size, contrast nudge, Infinite Machine look, claude on/off) stay open.
+
+- [x] Commit the 10-05 tab-rename WIP on its own first (91a85cf)
+- [x] Insert-without-sending: one path that drops text into the active tab (typed for Claude, bracketed paste for a shell, the chat composer when chat view is up)
+- [x] Saved prompts: sidebar "prompts" section + a per-repo section (repo = normalized origin remote, so clones/worktrees share); ~/.knife/prompts.json; click inserts, right-click paste/copy/edit/scope/delete, + adds
+- [x] Clipboard pile: terminal copies + OSC 52 land in a "clipboard" section (newest first, max 20, shown only when non-empty); click inserts and removes, right-click removes, clear empties
+- [x] Project right-click: continue last chat (or switch to the tab that has it), resume chat ▸ recent chats with titles + age (✓ if open), new chat
+- [x] `make mac` BUILD SUCCEEDED + unit checks on the pure parts (repo key, chat titles)
+- [ ] Hands-on QA after Eddie relaunches: ⌘C and Claude's /copy fill the pile; a prompt click in a Claude tab vs a shell vs chat view; the add sheet (⌘↩ saves); repo section after a cd; project menu checkmarks + switching to an open tab
+
+Notes: chat-view copies aren't captured (SwiftUI text selection has no hook). OSC 52 is caught by a pass-through terminalDelegate (ClipboardTap) — a SwiftTerm upgrade that adds delegate methods needs them forwarded there. The project menu's chat list is built in its own view's body, which SwiftUI runs once per right-click, not per render (measured).

@@ -118,7 +118,7 @@ struct ChatPane: View {
                 .padding(.horizontal, 16).padding(.top, 8)
             }
             // its own view: a keystroke re-renders the field, not every message above it
-            Composer(font: mono(12)) { text in
+            Composer(font: mono(12), controller: controller) { text in
                 tab.view.typeLine(text)
                 // shown at once; the transcript's copy (user record or queue entry) replaces it
                 echoes.append((text.trimmingCharacters(in: .whitespacesAndNewlines), Date()))
@@ -554,17 +554,26 @@ struct ChatPane: View {
 
 private struct Composer: View {
     let font: Font
+    let controller: KnifeWindowController // whose sidebar prompts and clips land in this draft
     let send: (String) -> Void
     @State private var draft = ""
+    @FocusState private var focused: Bool
 
     var body: some View {
         TextField("message", text: $draft, axis: .vertical)
             .textFieldStyle(.plain).font(font).lineLimit(1...6)
+            .focused($focused)
             .padding(.horizontal, 16).padding(.vertical, 10)
             .onSubmit {
                 guard !draft.isEmpty else { return }
                 send(draft)
                 draft = ""
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .knifeChatInsert)) { note in
+                guard note.object as? KnifeWindowController === controller,
+                      let text = note.userInfo?["text"] as? String else { return }
+                draft += text
+                focused = true
             }
     }
 }

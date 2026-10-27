@@ -7,6 +7,7 @@ extension Notification.Name {
     static let knifeFocusSearch = Notification.Name("knife.focusSearch")
     static let knifeChatFind = Notification.Name("knife.chatFind") // object: window controller; userInfo["action"]: NSTextFinder.Action
     static let knifeToggleSidebar = Notification.Name("knife.toggleSidebar")
+    static let knifeChatInsert = Notification.Name("knife.chatInsert") // object: window controller; userInfo["text"]: String
 }
 
 // Chrome type: Helvetica Now Text (system-installed); the terminal grid stays monospace.
@@ -124,6 +125,8 @@ struct SidebarView: View {
     @State private var tabContextText = ""
     /// tab id → the group it was in when the pointer arrived over the tab list.
     @State private var frozen: [Int: SidebarGroup]? = nil
+    @State private var activeRepo: RepoKey?   // the active tab's, for its prompt section
+    @State private var pointerInside = false
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -166,6 +169,8 @@ struct SidebarView: View {
                         .padding(.horizontal, 10).padding(.vertical, 4)
                     }
                     .buttonStyle(.plain)
+
+                    PromptSections(controller: controller, repo: activeRepo)
 
                     Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1)
                         .padding(.vertical, 6)
@@ -235,13 +240,15 @@ struct SidebarView: View {
                 }
                 .padding(.vertical, 4)
             }
+            .onHover { pointerInside = $0 }
 
         }
         .onDrop(of: [.text], isTargeted: nil) { _ in
             endDrag()
             return true
         }
-        .onAppear(perform: rebuild)
+        .onAppear { rebuild(); refreshRepo() }
+        .onChange(of: controller.activeId) { refreshRepo() }
         // A hover exit never arrives if you leave the app with the pointer parked on
         // the tabs; don't leave the list frozen until the mouse moves again.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { n in
@@ -251,8 +258,14 @@ struct SidebarView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { n in
             guard (n.object as? NSWindow) === controller.window else { return }
             rebuild()
+            refreshRepo()
         }
-        .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in rebuild() } // manifest syncs every ~10s
+        .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in // manifest syncs every ~10s
+            rebuild()
+            // a cd into or out of a repo shows up here; not while the pointer is over the sidebar,
+            // where the repo section appearing would slide every row below it under the pointer
+            if !pointerInside { refreshRepo() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .knifeFocusSearch)) { _ in
             if controller.window?.isKeyWindow ?? false { searchFocused = true }
         }
@@ -339,6 +352,7 @@ struct SidebarView: View {
     private func projectRow(_ p: Project) -> some View {
         ProjectRow(project: p, starred: meta.byPath[p.path]?.starred ?? false,
                    open: { open(project: p) },
+                   openChat: { open(project: p, cmd: $0) },
                    toggleStar: { toggleStar(p) },
                    move: { move(p, to: $0) },
                    rename: { renameText = p.name; renaming = p })
@@ -371,6 +385,11 @@ struct SidebarView: View {
         var set = Set(collapsedRaw.split(separator: ",").map(String.init))
         if !set.insert(section.rawValue).inserted { set.remove(section.rawValue) }
         collapsedRaw = set.sorted().joined(separator: ",")
+    }
+
+    private func refreshRepo() {
+        let next = controller.activeTab?.currentCwd.flatMap(Repos.key(for:))
+        if next != activeRepo { activeRepo = next }
     }
 
     private func rebuild() {
@@ -420,9 +439,10 @@ struct SidebarView: View {
         rebuild()
     }
 
-    private func open(project p: Project) {
+    /// A fresh `claude` restores as `claude -c`; `claude -c` and `claude --resume <id>` restore as themselves.
+    private func open(project p: Project, cmd: String = "claude") {
         Projects.touch(p.path)
-        controller.addTab(TabOptions(cwd: p.path, cmd: "claude", title: p.name, restoreCmd: "claude -c",
+        controller.addTab(TabOptions(cwd: p.path, cmd: cmd, title: p.name, restoreCmd: cmd == "claude" ? "claude -c" : cmd,
                                      lastActivity: Date()))
         query = ""
         searchFocused = false
@@ -515,6 +535,7 @@ private struct ProjectRow: View {
     let project: Project
     let starred: Bool
     let open: () -> Void
+    let openChat: (String) -> Void   // a tab in the project running this claude command
     let toggleStar: () -> Void
     let move: (ProjectSection) -> Void
     let rename: () -> Void
@@ -537,6 +558,8 @@ private struct ProjectRow: View {
         .onTapGesture(perform: open)
         .onHover { hovering = $0 }
         .contextMenu {
+            ProjectChatsMenu(path: project.path, newChat: open, openChat: openChat)
+            Divider()
             Button(starred ? "unstar" : "star", action: toggleStar)
             Button("rename…", action: rename)
             Divider()
@@ -562,6 +585,37 @@ private struct ProjectRow: View {
         } else {
             Button("No Git Remote") {}.disabled(true)
         }
+    }
+}
+
+/// A project's chats at the top of its right-click menu. Its own view because SwiftUI runs a
+/// .contextMenu builder on every render of the row (the sidebar re-renders on a 10 s timer and on
+/// hover), but a view's body inside the menu only when the menu is built, once per right-click —
+/// so the folder listing and title reads happen then, not per row per render.
+private struct ProjectChatsMenu: View {
+    let path: String
+    let newChat: () -> Void
+    let openChat: (String) -> Void
+
+    var body: some View {
+        let chats = RecentChats.list(cwd: path)
+        // a chat already open in a tab is taken to, not opened twice: two tabs on one session talk over each other
+        Button("continue last chat") {
+            if let last = chats.first, let tab = AppModel.shared.tab(session: last.id) { AppModel.shared.reveal(tab) }
+            else { openChat("claude -c") }
+        }
+        .disabled(chats.isEmpty)
+        Menu("resume chat") {
+            if chats.isEmpty { Button("none yet") {}.disabled(true) }
+            ForEach(chats) { c in
+                let label = (c.title.count > 60 ? String(c.title.prefix(59)) + "…" : c.title) + "   " + RecentChats.age(c.modified)
+                Toggle(label, isOn: Binding(get: { AppModel.shared.tab(session: c.id) != nil }, set: { _ in
+                    if let tab = AppModel.shared.tab(session: c.id) { AppModel.shared.reveal(tab) }
+                    else { openChat("claude --resume \(c.id)") }
+                }))
+            }
+        }
+        Button("new chat", action: newChat)
     }
 }
 

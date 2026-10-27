@@ -3,7 +3,7 @@ import KnifeKit
 
 /// Reads a tab's agent session transcript so the chat view and the phone can render
 /// the conversation instead of the raw screen. Claude Code writes one JSONL per
-/// session under ~/.claude/projects/<cwd-slug>/; Codex CLI under
+/// session under ClaudeProjects.dir(for: cwd); Codex CLI under
 /// ~/.codex/sessions/Y/M/D/ with the cwd in the first line. A tab's hooks report
 /// its exact transcript (TabModel.transcriptPath); without one, the newest
 /// transcript for the cwd that no other tab has claimed is what the tab is doing.
@@ -85,8 +85,7 @@ enum TranscriptReader {
     }
 
     private static func newestClaude(_ cwd: String, _ claimed: Set<String>) -> Found? {
-        let slug = String(cwd.map { $0.isLetter || $0.isNumber ? $0 : "-" })
-        let dir = NSHomeDirectory() + "/.claude/projects/" + slug
+        let dir = ClaudeProjects.dir(for: cwd)
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return nil }
         var newest: Found?
         for name in names where name.hasSuffix(".jsonl") {

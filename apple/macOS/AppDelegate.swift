@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         AppModel.shared.checkSocket()
+        AppModel.shared.prompts.reload() // the file may have been edited by hand
         if let wc = AppModel.shared.frontWindow(), let t = wc.activeTab, t.attention {
             t.attention = false
         }

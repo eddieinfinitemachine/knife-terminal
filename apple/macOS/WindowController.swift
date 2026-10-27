@@ -90,6 +90,22 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
         AppModel.shared.saveSessionSoon()
     }
 
+    /// Put text where you're typing in the active tab, without sending it (sidebar prompts and
+    /// clips). Chat view up → its composer's draft. Claude Code → typed, since it reads a fast
+    /// burst as a paste and tags it <pasted_content> (see typeLine). Anything else → pasted.
+    func insertIntoActiveTab(_ text: String) {
+        guard let tab = activeTab, !text.isEmpty else { return }
+        if chatShowing && !showBoard {
+            NotificationCenter.default.post(name: .knifeChatInsert, object: self, userInfo: ["text": text])
+            return
+        }
+        // by executable path in one pass over the process table: claude renames its process to
+        // its version, and claudeRunning's pgrep is a subprocess
+        let pid = tab.shellPid
+        if pid > 0, TabModel.agentsByShell([pid])[pid] == "claude" { tab.view.typeText(text) } else { tab.view.pasteText(text) }
+        if let w = window, tab.view.window === w { w.makeFirstResponder(tab.view) }
+    }
+
     func moveTab(_ id: Int, before targetId: Int) {
         guard id != targetId,
               let from = tabs.firstIndex(where: { $0.id == id }),

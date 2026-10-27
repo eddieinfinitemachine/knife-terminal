@@ -55,6 +55,8 @@ final class KnifeTermView: LocalProcessTerminalView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        clipboardTap.view = self
+        terminalDelegate = clipboardTap
         bellStyle = .none // we run our own attention/chime logic
         registerForDraggedTypes([.fileURL])
         installKeyMonitor()
@@ -193,17 +195,75 @@ final class KnifeTermView: LocalProcessTerminalView {
     /// a CR inside it as a newline — so text goes out in 256-character writes 15 ms apart, newlines
     /// as Ctrl+J, Enter last. (Measured by Origin on 2.1.278: 512 chars per 20 ms stays typed.)
     func typeLine(_ text: String) {
-        var t = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-            .replacingOccurrences(of: "\t", with: "    ")
-        t = String(String.UnicodeScalarView(t.unicodeScalars.filter { $0 == "\n" || ($0.value >= 0x20 && $0.value != 0x7f) }))
+        var t = Self.typable(text)
         if t.hasSuffix("\\") { t += " " }   // a backslash before Enter makes it a newline
+        let typed = sendTyped(t)
+        DispatchQueue.main.asyncAfter(deadline: .now() + typed + 0.25) { [weak self] in self?.send(txt: "\r") }
+    }
+
+    /// The same typing without the Enter: the text waits on the input line for you to finish it.
+    func typeText(_ text: String) { sendTyped(Self.typable(text)) }
+
+    /// Paste text the way ⌘V does, bracketed when the program turned that on (shells do), so a
+    /// multi-line block lands as one edit instead of running line by line. ESC is dropped so the
+    /// text can't close the bracket early.
+    func pasteText(_ text: String) {
+        var t = String(String.UnicodeScalarView(text.replacingOccurrences(of: "\r\n", with: "\n").unicodeScalars
+            .filter { $0 == "\n" || $0 == "\t" || ($0.value >= 0x20 && $0.value != 0x7f) }))
+        if getTerminal().bracketedPasteMode { t = "\u{1b}[200~" + t + "\u{1b}[201~" }
+        send(txt: t)
+        onUserInput?() // a bracketed paste starts with ESC, which send(source:) doesn't count as typing
+    }
+
+    /// CRs as newlines (Ctrl+J), tabs as spaces, other control characters dropped.
+    private static func typable(_ text: String) -> String {
+        let t = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\t", with: "    ")
+        return String(String.UnicodeScalarView(t.unicodeScalars.filter { $0 == "\n" || ($0.value >= 0x20 && $0.value != 0x7f) }))
+    }
+
+    /// Sends `t` in typing-speed chunks; returns how long until the last one is out.
+    @discardableResult
+    private func sendTyped(_ t: String) -> TimeInterval {
         let chars = Array(t)
         let chunks = stride(from: 0, to: chars.count, by: 256).map { String(chars[$0..<min($0 + 256, chars.count)]) }
         for (i, c) in chunks.enumerated() {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.015 * Double(i)) { [weak self] in self?.send(txt: c) }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.015 * Double(chunks.count) + 0.25) { [weak self] in self?.send(txt: "\r") }
+        return 0.015 * Double(chunks.count)
     }
+
+    // ─── Copies Knife makes land on the sidebar's clipboard pile ───
+
+    /// ⌘C / Edit › Copy with a selection: whatever SwiftTerm put on the pasteboard.
+    override func copy(_ sender: Any) {
+        super.copy(sender)
+        if let s = NSPasteboard.general.string(forType: .string) { AppModel.shared.clips.add(s) }
+    }
+
+    /// OSC 52 writes (Claude Code's /copy). SwiftTerm handles them in clipboardCopy, which isn't
+    /// open, so this sits in front of the view as its terminalDelegate and passes every call through.
+    private final class ClipboardTap: TerminalViewDelegate {
+        weak var view: TerminalViewDelegate?
+
+        func clipboardCopy(source: TerminalView, content: Data) {
+            view?.clipboardCopy(source: source, content: content) // still writes the pasteboard
+            guard let s = String(data: content, encoding: .utf8) else { return }
+            DispatchQueue.main.async { AppModel.shared.clips.add(s) }
+        }
+
+        func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) { view?.sizeChanged(source: source, newCols: newCols, newRows: newRows) }
+        func setTerminalTitle(source: TerminalView, title: String) { view?.setTerminalTitle(source: source, title: title) }
+        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) { view?.hostCurrentDirectoryUpdate(source: source, directory: directory) }
+        func send(source: TerminalView, data: ArraySlice<UInt8>) { view?.send(source: source, data: data) }
+        func scrolled(source: TerminalView, position: Double) { view?.scrolled(source: source, position: position) }
+        func requestOpenLink(source: TerminalView, link: String, params: [String: String]) { view?.requestOpenLink(source: source, link: link, params: params) }
+        func bell(source: TerminalView) { view?.bell(source: source) }
+        func clipboardRead(source: TerminalView) -> Data? { view?.clipboardRead(source: source) }
+        func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) { view?.iTermContent(source: source, content: content) }
+        func rangeChanged(source: TerminalView, startY: Int, endY: Int) { view?.rangeChanged(source: source, startY: startY, endY: endY) }
+    }
+    private let clipboardTap = ClipboardTap() // terminalDelegate is weak: the view holds the tap
 
     /// The visible screen as styled runs (colors, bold, …) for the iOS mirror.
     /// The screen as plain text, trailing blanks trimmed (the overseer reads this).

@@ -7,6 +7,8 @@ final class AppModel: ObservableObject {
     static let shared = AppModel()
 
     let theme = ThemeManager()
+    let prompts = PromptStore(path: Manifest.dir + "/prompts.json")
+    let clips = ClipPile(path: Manifest.dir + "/clips.json")
     var windows: [KnifeWindowController] = []
     weak var mostRecentWindow: KnifeWindowController?
     private var nextTabId = 1
@@ -22,6 +24,17 @@ final class AppModel: ObservableObject {
 
     func tab(_ id: Int) -> TabModel? { tabById[id] }
     func window(of tab: TabModel) -> KnifeWindowController? { owner[tab.id] }
+
+    /// The tab, in any window, that has this Claude session open (from its hooks).
+    func tab(session id: String) -> TabModel? { tabById.values.first { $0.sessionId == id } }
+
+    /// Bring a tab forward: its window to the front, the tab active.
+    func reveal(_ tab: TabModel) {
+        guard let wc = owner[tab.id] else { return }
+        wc.showBoard = false
+        wc.activate(tab.id)
+        wc.window?.makeKeyAndOrderFront(nil)
+    }
 
     /// The window to talk to: key, else most recently used, else any.
     func frontWindow() -> KnifeWindowController? {
