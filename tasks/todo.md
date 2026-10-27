@@ -194,5 +194,6 @@ Four agents in parallel worktrees off 30150a2 (~/Code/.worktrees/knife-zach-*), 
 - [x] sidebar (merged 8e59586; folder tests 55/55) — claude on/off footer switch (⌘T/+ start claude when on; ⌥⌘T and shift-click = shell; right-click + menu); your own root folders; sidebar folders inside status sections (nested, collapsible, drag to file)
 - [x] rail (merged 92b774f; trust+rail tests 91/91) — prompt ticks beside a Claude tab, hover to read, click to scroll back to it; auto-trust folders whose remote owner is yours (~/.knife/config.json trustedOwners) in ~/.claude.json. ~/.knife/config.json pre-created with eddieinfinitemachine, infinite-machine, waldenmeditation (gh account + admin orgs) — the app's own seed would also have trusted cheewee2000 and ramp-public. Gaps: one-line `cd x && claude` races the follow check; SwiftTerm's 500-line scrollback limits how far back the rail can jump outside fullscreen mode
 - [x] Merge all four, `make mac`, re-run every logic test
-- [ ] Infinite Machine look (#8) on top of the merged result — last, since it restyles everything
-- [ ] `make install-mac`; Eddie relaunches; hands-on QA
+- [x] Infinite Machine look (a6aecda): tokens in ThemeManager (Tone / Color.ink…live), Helvetica Now Display Regular only, numbered section labels, solid ink active tab, 48pt header (repo label + chat title), SF Mono terminal, #00ff57 dot
+- [x] All suites green on final main (pile, folders 55, trust/rail 91, input 94); `make install-mac` 19:06
+- [ ] Eddie relaunches; hands-on QA of everything above (none of it has been driven by hand)
