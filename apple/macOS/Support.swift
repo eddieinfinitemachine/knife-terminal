@@ -224,9 +224,12 @@ struct ProjectMeta: Codable, Equatable {
 }
 
 enum Projects {
+    /// Optional fields came later: a file saved before them still decodes.
     struct SidebarMeta: Codable {
         var byPath: [String: ProjectMeta] = [:]
         var order: [String: [String]] = [:]
+        var tree: FolderTree? = nil   // folders made in the sidebar (SidebarFolders.swift)
+        var roots: [String]? = nil    // folders added from disk, scanned like codeRoots
     }
 
     static func encode(_ p: String) -> String {
@@ -246,11 +249,14 @@ enum Projects {
 
     static func saveMeta(_ meta: SidebarMeta) {
         var cleaned = meta
-        let projects = list()
+        let projects = list(extraRoots: meta.roots ?? [])
         let currentPaths = Set(projects.map(\.path))
         cleaned.byPath = cleaned.byPath.filter {
             currentPaths.contains($0.key) && $0.value != ProjectMeta()
         }
+        cleaned.tree?.prune(keeping: currentPaths)
+        if cleaned.tree?.isEmpty == true { cleaned.tree = nil }
+        if cleaned.roots?.isEmpty == true { cleaned.roots = nil }
         let members = Dictionary(uniqueKeysWithValues: sectioned(projects, meta: cleaned).map {
             ($0.0.rawValue, Set($0.1.map(\.path)))
         })
@@ -281,6 +287,13 @@ enum Projects {
     /// loses recency once transcripts age out of ~/.claude/projects).
     static let codeRoots = ["Code/active", "Code/tools", "Code/experiments", "Code/archive"]
 
+    static var builtInRoots: [String] { codeRoots.map { (NSHomeDirectory() as NSString).appendingPathComponent($0) } }
+
+    /// The form a root is kept and compared in, so ~/x, /Users/me/x/ and a symlink to it are one root.
+    static func canonRoot(_ path: String) -> String {
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
     static func autoSection(_ p: Project, now: TimeInterval = Date().timeIntervalSince1970) -> ProjectSection {
         let archive = NSHomeDirectory() + "/Code/archive/"
         if p.path.hasPrefix(archive) { return .archived }
@@ -307,7 +320,8 @@ enum Projects {
         }
     }
 
-    static func list() -> [Project] {
+    /// `extraRoots`: folders added from disk; by default the saved ones.
+    static func list(extraRoots: [String]? = nil) -> [Project] {
         let home = NSHomeDirectory()
         let fm = FileManager.default
         let projDir = (home as NSString).appendingPathComponent(".claude/projects")
@@ -319,8 +333,7 @@ enum Projects {
            let projects = cfg["projects"] as? [String: Any] {
             paths.formUnion(projects.keys)
         }
-        for root in codeRoots {
-            let base = (home as NSString).appendingPathComponent(root)
+        for base in builtInRoots + (extraRoots ?? loadMeta().roots ?? []) {
             for name in (try? fm.contentsOfDirectory(atPath: base)) ?? [] where !name.hasPrefix(".") {
                 paths.insert((base as NSString).appendingPathComponent(name))
             }

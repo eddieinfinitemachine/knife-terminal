@@ -117,7 +117,16 @@ struct SidebarView: View {
     @State private var query = ""
     @State private var drag: SidebarDrag?
     @State private var hoverSection: ProjectSection?
+    /// The sidebar's folders. A project drag files into them as it goes (like `sectioned`) and
+    /// endDrag saves what's on screen.
+    @State private var tree = FolderTree()
+    /// Where a dragged folder would land if let go now, or the folder a project is held over.
+    @State private var folderSpot: FolderSpot?
+    @State private var naming: FolderNaming?
+    @State private var folderNameText = ""
     @AppStorage("knife.collapsedSections") private var collapsedRaw = ""
+    @AppStorage("knife.collapsedFolders") private var collapsedFoldersRaw = ""
+    @AppStorage("autoClaude") private var autoClaude = true
     @State private var renaming: Project?
     @State private var renameText = ""
     @State private var renamingTab: TabModel?
@@ -160,7 +169,8 @@ struct SidebarView: View {
                             withAnimation(.easeInOut(duration: 0.2)) { frozen = nil }
                         }
                     }
-                    Button(action: { controller.addTab() }) {
+                    // claude or a plain shell per the footer switch; shift-click for a plain shell once
+                    Button(action: { controller.newTab(claude: autoClaude && !NSEvent.modifierFlags.contains(.shift)) }) {
                         HStack(spacing: 6) {
                             Text("+").font(ui(12))
                             Text("new tab").font(ui(11))
@@ -169,6 +179,15 @@ struct SidebarView: View {
                         .padding(.horizontal, 10).padding(.vertical, 4)
                     }
                     .buttonStyle(.plain)
+                    .help(autoClaude ? "new tab running claude  ⌘T\nshift-click or ⌥⌘T for a plain shell · right-click to choose"
+                                     : "new tab, plain shell  ⌘T — claude is off in the footer\nright-click to choose")
+                    // either way, whatever the switch says; ⌘T is only shown where it applies
+                    .contextMenu {
+                        Button("new claude tab") { controller.newTab(claude: true) }
+                            .keyboardShortcut(autoClaude ? KeyboardShortcut("t", modifiers: .command) : nil)
+                        Button("new plain shell") { controller.newTab(claude: false) }
+                            .keyboardShortcut("t", modifiers: [.command, .option])
+                    }
 
                     PromptSections(controller: controller, repo: activeRepo)
 
@@ -192,29 +211,32 @@ struct SidebarView: View {
                         // Headers are always rendered: revealing them only while dragging
                         // reflowed the whole list the instant a row was picked up, so the
                         // row under the cursor was no longer the one you grabbed.
-                        ForEach(ProjectSection.allCases, id: \.self) { section in
-                            let rows = isCollapsed(section) ? [] : projects(in: section)
-                            sectionHeader(section)
-                                .onDrop(of: [.text], delegate: ProjectSectionDrop(
-                                    target: section, drag: $drag,
-                                    hoverSection: $hoverSection,
-                                    liveMove: liveMove(_:into:),
-                                    end: endDrag))
-                            ForEach(rows) { p in
-                                projectRow(p)
-                                    .opacity(drag == .project(p.path) ? 0.4 : 1.0)
-                                    .onDrag {
-                                        let path = p.path
-                                        DispatchQueue.main.async { drag = .project(path) }
-                                        return NSItemProvider(object: "proj:\(path)" as NSString)
-                                    }
-                                    .onDrop(of: [.text], delegate: ProjectRowDrop(
-                                        targetPath: p.path, targetSection: section,
-                                        drag: $drag,
-                                        liveMove: liveMove(_:before:in:),
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(ProjectSection.allCases, id: \.self) { section in
+                                let rows = projects(in: section)
+                                let byPath = Dictionary(rows.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+                                sectionHeader(section)
+                                    .onDrop(of: [.text], delegate: ProjectSectionDrop(
+                                        target: section, drag: $drag,
+                                        hoverSection: $hoverSection, folderSpot: $folderSpot,
+                                        canMove: tree.canMove(_:to:),
+                                        liveMove: liveMove(_:into:),
                                         end: endDrag))
+                                if !isCollapsed(section) {
+                                    ForEach(tree.lines(in: section, paths: rows.map(\.path), collapsed: isFolderCollapsed)) { line in
+                                        switch line {
+                                        case .folder(let f, let depth, let count):
+                                            folderHeader(f, depth: depth, count: count)
+                                        case .project(let path, let depth):
+                                            if let p = byPath[path] { sectionRow(p, in: section, depth: depth) }
+                                        }
+                                    }
+                                }
                             }
                         }
+                        // the list's own right-click (rows and headers have theirs): folders from disk
+                        .contentShape(Rectangle())
+                        .contextMenu { rootsMenu }
                     } else {
                         ForEach(filtered) { p in projectRow(p) }
                     }
@@ -249,6 +271,14 @@ struct SidebarView: View {
         }
         .onAppear { rebuild(); refreshRepo() }
         .onChange(of: controller.activeId) { refreshRepo() }
+        .alert(naming?.title ?? "", isPresented: Binding(
+            get: { naming != nil }, set: { if !$0 { naming = nil } })) {
+            TextField("name", text: $folderNameText)
+            Button("save") { commitFolderName() }
+            Button("cancel", role: .cancel) { naming = nil }
+        } message: {
+            Text("a folder in the sidebar only — nothing on disk changes")
+        }
         // A hover exit never arrives if you leave the app with the pointer parked on
         // the tabs; don't leave the list frozen until the mouse moves again.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { n in
@@ -257,11 +287,11 @@ struct SidebarView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { n in
             guard (n.object as? NSWindow) === controller.window else { return }
-            rebuild()
+            rebuildIfIdle()
             refreshRepo()
         }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in // manifest syncs every ~10s
-            rebuild()
+            rebuildIfIdle()
             // a cd into or out of a repo shows up here; not while the pointer is over the sidebar,
             // where the repo section appearing would slide every row below it under the pointer
             if !pointerInside { refreshRepo() }
@@ -349,13 +379,99 @@ struct SidebarView: View {
         sectioned.first { $0.0 == section }?.1 ?? []
     }
 
-    private func projectRow(_ p: Project) -> some View {
+    private func projectRow(_ p: Project, depth: Int = 0) -> some View {
         ProjectRow(project: p, starred: meta.byPath[p.path]?.starred ?? false,
+                   indent: Self.indent(depth),
+                   folder: meta.tree?.place[p.path].flatMap { meta.tree?.folder($0)?.name },
                    open: { open(project: p) },
                    openChat: { open(project: p, cmd: $0) },
                    toggleStar: { toggleStar(p) },
                    move: { move(p, to: $0) },
-                   rename: { renameText = p.name; renaming = p })
+                   rename: { renameText = p.name; renaming = p },
+                   unfile: { saveTree { $0.file(p.path, into: nil) } })
+    }
+
+    /// A project in its section (or one of the section's folders), draggable.
+    private func sectionRow(_ p: Project, in section: ProjectSection, depth: Int) -> some View {
+        projectRow(p, depth: depth)
+            .opacity(drag == .project(p.path) || draggedFolderHolds(tree.folder(of: p.path, in: section)) ? 0.4 : 1.0)
+            .onDrag {
+                let path = p.path
+                DispatchQueue.main.async { drag = .project(path) }
+                return NSItemProvider(object: "proj:\(path)" as NSString)
+            }
+            .onDrop(of: [.text], delegate: ProjectRowDrop(
+                targetPath: p.path, targetSection: section,
+                drag: $drag,
+                liveMove: liveMove(_:before:in:),
+                end: endDrag))
+    }
+
+    private static func indent(_ depth: Int) -> CGFloat { CGFloat(depth) * 12 }
+    /// Fixed so a folder dragged over one can tell its top, middle and bottom apart.
+    static let folderRowHeight: CGFloat = 21
+
+    private func folderHeader(_ f: SidebarFolder, depth: Int, count: Int) -> some View {
+        let shut = isFolderCollapsed(f.id)
+        return HStack(spacing: 6) {
+            Text(shut ? "▸" : "▾").font(ui(10)).foregroundStyle(.tertiary).frame(width: 14)
+            Text(f.name).font(ui(11)).foregroundStyle(.secondary).lineLimit(1)
+            if shut { Text("\(count)").font(ui(10)).foregroundStyle(.tertiary) }
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 10 + Self.indent(depth)).padding(.trailing, 10)
+        .frame(height: Self.folderRowHeight)
+        // drop feedback draws over the row, never beside it: nothing reflows mid-drag
+        .background(folderSpot == .into(f.id) ? theme.accentColor.opacity(0.15) : Color.clear)
+        .overlay(alignment: .top) {
+            if folderSpot == .before(f.id) { Rectangle().fill(theme.accentColor).frame(height: 2) }
+        }
+        .overlay(alignment: .bottom) {
+            if folderSpot == .after(f.id) { Rectangle().fill(theme.accentColor).frame(height: 2) }
+        }
+        .opacity(draggedFolderHolds(f.id) ? 0.4 : 1.0)
+        .contentShape(Rectangle())
+        .onTapGesture { toggleFolder(f.id) }
+        .contextMenu {
+            Button("new folder") { startNaming(.new(f.section, parent: f.id)) }
+            Button("rename…") { startNaming(.rename(f)) }
+            Button("delete “\(f.name)”") { deleteFolder(f.id) }
+        }
+        .help("a sidebar folder — drag projects onto it; drag it to reorder or nest")
+        .onDrag {
+            let id = f.id
+            DispatchQueue.main.async { drag = .folder(id) }
+            return NSItemProvider(object: "folder:\(id)" as NSString)
+        }
+        .onDrop(of: [.text], delegate: FolderDrop(
+            folder: f, open: !shut, drag: $drag, spot: $folderSpot,
+            canMove: tree.canMove(_:to:),
+            fileInto: liveMove(_:intoFolder:),
+            end: endDrag))
+    }
+
+    /// The folder being dragged is `id` or holds it, so it dims with the rest of what's moving.
+    private func draggedFolderHolds(_ id: String?) -> Bool {
+        guard case .folder(let dragged) = drag, let id else { return false }
+        return tree.isInside(id, dragged)
+    }
+
+    /// Adding and removing folders from disk: the project list's own right-click and each
+    /// section's. Only folders added here can be removed; the built-in code roots can't.
+    @ViewBuilder
+    private var rootsMenu: some View {
+        Button("add folder from disk…", action: addRoot)
+        let roots = meta.roots ?? []
+        if !roots.isEmpty { Divider() }
+        ForEach(roots, id: \.self) { r in
+            Button("remove “\(rootLabel(r, among: roots))” from sidebar") { removeRoot(r) }
+        }
+    }
+
+    private func rootLabel(_ r: String, among roots: [String]) -> String {
+        let name = (r as NSString).lastPathComponent
+        let twins = roots.filter { ($0 as NSString).lastPathComponent == name }.count
+        return twins > 1 ? (r as NSString).abbreviatingWithTildeInPath : name
     }
 
     private func sectionHeader(_ section: ProjectSection) -> some View {
@@ -375,6 +491,82 @@ struct SidebarView: View {
         .background(hoverSection == section ? theme.accentColor.opacity(0.15) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture { toggleCollapse(section) }
+        .contextMenu {
+            Button("new folder") { startNaming(.new(section, parent: nil)) }
+            Divider()
+            rootsMenu
+        }
+    }
+
+    private func isFolderCollapsed(_ id: String) -> Bool {
+        collapsedFoldersRaw.split(separator: ",").contains(Substring(id))
+    }
+
+    private func toggleFolder(_ id: String) { setFolder(id, collapsed: !isFolderCollapsed(id)) }
+
+    private func setFolder(_ id: String, collapsed: Bool) {
+        var set = Set(collapsedFoldersRaw.split(separator: ",").map(String.init))
+        if collapsed { set.insert(id) } else { set.remove(id) }
+        collapsedFoldersRaw = set.sorted().joined(separator: ",")
+    }
+
+    private func startNaming(_ n: FolderNaming) {
+        if case .rename(let f) = n { folderNameText = f.name } else { folderNameText = "new folder" }
+        naming = n
+    }
+
+    private func commitFolderName() {
+        guard let n = naming else { return }
+        naming = nil
+        let name = folderNameText.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        switch n {
+        case .new(let section, let parent):
+            // open the way to it, so the new folder is on screen
+            if isCollapsed(section) { toggleCollapse(section) }
+            if let parent { setFolder(parent, collapsed: false) }
+            saveTree { $0.add(name, in: section, parent: parent) }
+        case .rename(let f):
+            saveTree { $0.rename(f.id, to: name) }
+        }
+    }
+
+    private func deleteFolder(_ id: String) {
+        setFolder(id, collapsed: false) // forget its fold state with it
+        saveTree { $0.delete(id) }
+    }
+
+    /// A change to the saved folders outside a drag: on the saved tree, not the live one.
+    private func saveTree(_ change: (inout FolderTree) -> Void) {
+        var next = Projects.loadMeta()
+        var t = next.tree ?? FolderTree()
+        change(&t)
+        next.tree = t
+        Projects.saveMeta(next)
+        rebuild()
+    }
+
+    private func addRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.canCreateDirectories = true
+        panel.prompt = "Add to Sidebar"
+        panel.message = "The projects inside this folder are listed in the sidebar. Nothing in it is changed."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let dir = Projects.canonRoot(url.path)
+        var next = Projects.loadMeta()
+        let listed = (Projects.builtInRoots + (next.roots ?? [])).map(Projects.canonRoot)
+        guard !listed.contains(dir) else { NSSound.beep(); return } // already scanned
+        next.roots = (next.roots ?? []) + [dir]
+        Projects.saveMeta(next)
+        rebuild()
+    }
+
+    /// Forgets the folder; nothing on disk is touched.
+    private func removeRoot(_ root: String) {
+        var next = Projects.loadMeta()
+        next.roots?.removeAll { $0 == root }
+        Projects.saveMeta(next)
+        rebuild()
     }
 
     private func isCollapsed(_ section: ProjectSection) -> Bool {
@@ -401,6 +593,19 @@ struct SidebarView: View {
         }
         elsewhere = remote
         sectioned = Projects.sectioned(projects, meta: meta)
+        tree = meta.tree ?? FolderTree()
+    }
+
+    /// The timer's and window focus's rebuild, held off mid-drag: it would reset the live order
+    /// and pull the row you're holding back to where it started. A drag can't outlast the mouse
+    /// button, so one still set with the button up was let go outside the window: end it the
+    /// way any drop ends, keeping what's on screen.
+    private func rebuildIfIdle() {
+        if drag != nil {
+            guard NSEvent.pressedMouseButtons & 1 == 0 else { return }
+            endDrag()
+        }
+        rebuild()
     }
 
     private func startTabRename(_ tab: TabModel) {
@@ -458,51 +663,75 @@ struct SidebarView: View {
         rebuild()
     }
 
+    /// The menu's "move to …": to another section, out of its folder; to its own, left where it is.
     private func move(_ p: Project, to section: ProjectSection) {
-        commitDrop(p.path, into: section, snapshotOrder: nil)
+        let current = sectioned.first { $0.1.contains { $0.path == p.path } }?.0
+        commitDrop(p.path, into: section,
+                   folder: current == section ? tree.folder(of: p.path, in: section) : nil, snapshotOrder: nil)
     }
 
     /// Ends whatever drag is in flight by persisting the live order the user can
     /// already see. Every drop target funnels here, so releasing anywhere in the
-    /// sidebar sticks instead of snapping back on the next rebuild.
+    /// sidebar sticks instead of snapping back on the next rebuild. A folder isn't
+    /// moved live (it would carry its rows across the pointer); it goes to the spot
+    /// marked while hovering, if there was one.
     private func endDrag() {
         hoverSection = nil
-        guard case .project(let path) = drag,
-              let section = sectioned.first(where: { $0.1.contains { $0.path == path } })?.0 else {
+        let spot = folderSpot
+        folderSpot = nil
+        switch drag {
+        case .project(let path):
+            if let section = sectioned.first(where: { $0.1.contains { $0.path == path } })?.0 {
+                commitDrop(path, into: section, folder: tree.folder(of: path, in: section),
+                           snapshotOrder: projects(in: section).map(\.path))
+            } else {
+                drag = nil
+            }
+        case .folder(let id):
             drag = nil
-            return
+            if let spot, tree.canMove(id, to: spot) { saveTree { $0.move(id, to: spot) } }
+        default:
+            drag = nil
         }
-        commitDrop(path, into: section, snapshotOrder: projects(in: section).map(\.path))
     }
 
-    /// Hovering a section header parks the row at the top of that section, so a
-    /// header drop lands where it looks like it will instead of by recency.
+    /// Hovering a section header parks the row at the top of that section's loose
+    /// rows, so a header drop lands where it looks like it will instead of by recency.
     private func liveMove(_ path: String, into section: ProjectSection) {
-        guard let fromSection = sectioned.firstIndex(where: { $0.1.contains { $0.path == path } }),
-              let fromRow = sectioned[fromSection].1.firstIndex(where: { $0.path == path }),
-              let toSection = sectioned.firstIndex(where: { $0.0 == section }),
-              !(fromSection == toSection && fromRow == 0) else { return }
-        let p = sectioned[fromSection].1.remove(at: fromRow)
-        sectioned[toSection].1.insert(p, at: 0)
+        liveMove(path, to: section) { $0.place(path, atTopOf: section, order: &$1) }
     }
 
+    /// Hovering a row takes its place: same folder (or loose), right beside it.
     private func liveMove(_ path: String, before targetPath: String, in section: ProjectSection) {
-        guard path != targetPath,
-              let fromSection = sectioned.firstIndex(where: { rows in rows.1.contains { $0.path == path } }),
-              let fromRow = sectioned[fromSection].1.firstIndex(where: { $0.path == path }),
-              let toSection = sectioned.firstIndex(where: { $0.0 == section }),
-              let toRow = sectioned[toSection].1.firstIndex(where: { $0.path == targetPath }) else { return }
-        if fromSection == toSection {
-            sectioned[fromSection].1.move(
-                fromOffsets: IndexSet(integer: fromRow),
-                toOffset: toRow > fromRow ? toRow + 1 : toRow)
-        } else {
-            let p = sectioned[fromSection].1.remove(at: fromRow)
-            sectioned[toSection].1.insert(p, at: toRow)
-        }
+        liveMove(path, to: section) { $0.place(path, nextTo: targetPath, in: section, order: &$1) }
     }
 
-    private func commitDrop(_ path: String, into target: ProjectSection, snapshotOrder: [String]?) {
+    /// Hovering a folder's name files the row at the top of that folder.
+    private func liveMove(_ path: String, intoFolder id: String) {
+        guard let section = tree.folder(id)?.section else { return }
+        liveMove(path, to: section) { $0.place(path, atTopOf: id, order: &$1) }
+    }
+
+    /// Moves a dragged project in what's drawn — `sectioned` and the live `tree` — leaving
+    /// the saving to endDrag. Only writes state that actually changed.
+    private func liveMove(_ path: String, to section: ProjectSection,
+                          _ change: (inout FolderTree, inout [String]) -> Void) {
+        guard let p = projects.first(where: { $0.path == path }),
+              let to = sectioned.firstIndex(where: { $0.0 == section }) else { return }
+        for i in sectioned.indices where i != to && sectioned[i].1.contains(where: { $0.path == path }) {
+            sectioned[i].1.removeAll { $0.path == path }
+        }
+        var order = sectioned[to].1.map(\.path)
+        var next = tree
+        change(&next, &order)
+        if next != tree { tree = next }
+        var byPath = Dictionary(sectioned[to].1.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        byPath[path] = p
+        let rows = order.compactMap { byPath[$0] }
+        if rows.map(\.path) != sectioned[to].1.map(\.path) { sectioned[to].1 = rows }
+    }
+
+    private func commitDrop(_ path: String, into target: ProjectSection, folder: String?, snapshotOrder: [String]?) {
         guard let p = projects.first(where: { $0.path == path }) else {
             drag = nil
             hoverSection = nil
@@ -518,6 +747,9 @@ struct SidebarView: View {
             saved.override = target == Projects.autoSection(p) ? nil : target
         }
         next.byPath[path] = saved
+        var t = next.tree ?? FolderTree()
+        t.file(path, into: folder)
+        next.tree = t
         for section in ProjectSection.allCases {
             let key = section.rawValue
             next.order[key]?.removeAll { $0 == path }
@@ -534,11 +766,14 @@ struct SidebarView: View {
 private struct ProjectRow: View {
     let project: Project
     let starred: Bool
+    var indent: CGFloat = 0     // a step per folder it's inside
+    var folder: String? = nil   // the sidebar folder it's filed in, by name
     let open: () -> Void
     let openChat: (String) -> Void   // a tab in the project running this claude command
     let toggleStar: () -> Void
     let move: (ProjectSection) -> Void
     let rename: () -> Void
+    let unfile: () -> Void
     @State private var hovering = false
 
     var body: some View {
@@ -553,7 +788,7 @@ private struct ProjectRow: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 3)
+        .padding(.leading, 10 + indent).padding(.trailing, 10).padding(.vertical, 3)
         .contentShape(Rectangle())
         .onTapGesture(perform: open)
         .onHover { hovering = $0 }
@@ -562,6 +797,7 @@ private struct ProjectRow: View {
             Divider()
             Button(starred ? "unstar" : "star", action: toggleStar)
             Button("rename…", action: rename)
+            if let folder { Button("take out of “\(folder)”", action: unfile) }
             Divider()
             Button("move to active") { move(.active) }
             Button("move to dormant") { move(.dormant) }
@@ -625,6 +861,20 @@ private struct ProjectChatsMenu: View {
 enum SidebarDrag: Equatable {
     case tab(Int)
     case project(String)
+    case folder(String)   // a sidebar folder's id
+}
+
+/// The folder-name alert: a new folder (in a section, or inside another folder) or a rename.
+private enum FolderNaming {
+    case new(ProjectSection, parent: String?)
+    case rename(SidebarFolder)
+
+    var title: String {
+        switch self {
+        case .new: "new folder"
+        case .rename: "rename folder"
+        }
+    }
 }
 
 /// Job request box: routed to a project and run in a job tab (same path as the phone).
@@ -700,24 +950,79 @@ private struct ProjectSectionDrop: DropDelegate {
     let target: ProjectSection
     @Binding var drag: SidebarDrag?
     @Binding var hoverSection: ProjectSection?
+    @Binding var folderSpot: FolderSpot?
+    let canMove: (String, FolderSpot) -> Bool
     let liveMove: (String, ProjectSection) -> Void
     let end: () -> Void
 
     func dropEntered(info: DropInfo) {
-        guard case .project(let from) = drag else { return }
-        DispatchQueue.main.async {
-            hoverSection = target
-            liveMove(from, target)
+        switch drag {
+        case .project(let from):
+            DispatchQueue.main.async {
+                hoverSection = target
+                liveMove(from, target)
+            }
+        case .folder(let id):
+            // to the section's top level — its own section only
+            guard canMove(id, .top(target)) else { return }
+            DispatchQueue.main.async {
+                hoverSection = target
+                folderSpot = .top(target)
+            }
+        default:
+            return
         }
     }
 
     func dropExited(info: DropInfo) {
-        guard hoverSection == target else { return }
-        DispatchQueue.main.async { hoverSection = nil }
+        DispatchQueue.main.async {
+            if hoverSection == target { hoverSection = nil }
+            if folderSpot == .top(target) { folderSpot = nil }
+        }
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         DropProposal(operation: drag == nil ? .forbidden : .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        DispatchQueue.main.async { end() }
+        return true
+    }
+}
+
+/// A sidebar folder's name. A project held over it files into it as you go, like the rows. A
+/// folder held over it only marks where it would land — above, inside, or below when it's
+/// closed — and moves on release: moved live, it would carry its rows across the pointer.
+private struct FolderDrop: DropDelegate {
+    let folder: SidebarFolder
+    let open: Bool
+    @Binding var drag: SidebarDrag?
+    @Binding var spot: FolderSpot?
+    let canMove: (String, FolderSpot) -> Bool
+    let fileInto: (String, String) -> Void
+    let end: () -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard case .project(let path) = drag else { return }
+        DispatchQueue.main.async {
+            spot = .into(folder.id)
+            fileInto(path, folder.id)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        if case .folder(let id) = drag {
+            let want = FolderSpot.over(folder.id, at: Double(info.location.y / SidebarView.folderRowHeight), open: open)
+            let next = canMove(id, want) ? want : nil
+            if next != spot { DispatchQueue.main.async { spot = next } }
+        }
+        return DropProposal(operation: drag == nil ? .forbidden : .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        let mine: [FolderSpot] = [.before(folder.id), .into(folder.id), .after(folder.id)]
+        DispatchQueue.main.async { if let s = spot, mine.contains(s) { spot = nil } }
     }
 
     func performDrop(info: DropInfo) -> Bool {
@@ -736,6 +1041,7 @@ struct FooterBar: View {
     @AppStorage("sidebarCollapsed") private var sidebarCollapsed = false
     @AppStorage("gitPanel") private var gitPanel = false
     @AppStorage("chatView") private var chatView = false
+    @AppStorage("autoClaude") private var autoClaude = true   // see KnifeWindowController.autoClaude
     @State private var hooksOn = HooksInstaller.installed()
     @State private var ctxScope: String? = nil
 
@@ -772,6 +1078,9 @@ struct FooterBar: View {
                 }
                 sep
                 btn("theme: " + theme.mode.rawValue, help: "cycle auto · light · dark") { theme.cycle() }
+                btn(autoClaude ? "claude on" : "claude off", on: autoClaude,
+                    help: autoClaude ? "new tabs start Claude Code — ⌥⌘T or shift-click “new tab” for a plain shell"
+                                     : "new tabs open a plain shell — click to start Claude Code in them") { autoClaude.toggle() }
                 btn(hooksOn ? "alerts on" : "alerts off", on: hooksOn, help: "Claude Code hooks for working/attention alerts") {
                     _ = HooksInstaller.install(); hooksOn = HooksInstaller.installed()
                 }

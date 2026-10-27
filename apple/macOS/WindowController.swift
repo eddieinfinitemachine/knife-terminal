@@ -53,6 +53,16 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
         return tab
     }
 
+    /// The footer's claude on/off switch: whether ⌘T, Shell › New Tab and "+ new tab" start
+    /// `claude`. On until switched off.
+    static var autoClaude: Bool { UserDefaults.standard.object(forKey: "autoClaude") as? Bool ?? true }
+
+    /// A tab asked for by hand. Claude starts where a plain shell would, and comes back on relaunch
+    /// the way a project's claude tab does: its own chat once the hooks have named it, else `claude -c`.
+    func newTab(claude: Bool) {
+        addTab(claude ? TabOptions(cmd: "claude", restoreCmd: "claude -c", lastActivity: Date()) : TabOptions())
+    }
+
     func activate(_ id: Int) {
         guard let t = tabs.first(where: { $0.id == id }) else { return }
         activeId = id
