@@ -111,6 +111,10 @@ struct ChatPane: View {
                     reveal(id) // open its run / input first, then scroll once it's laid out
                     DispatchQueue.main.async { withAnimation { proxy.scrollTo(id, anchor: .center) } }
                 }
+                .onReceive(NotificationCenter.default.publisher(for: .knifeChatScrollTo)) { note in // the prompt rail
+                    guard note.object as? KnifeWindowController === controller, let id = note.userInfo?["id"] as? String else { return }
+                    withAnimation { proxy.scrollTo(id, anchor: .top) }
+                }
             }
             Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1)
             let model = msgs.last { $0.model != nil }?.model

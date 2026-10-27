@@ -266,6 +266,7 @@ final class AppModel: ObservableObject {
                 let next: String? = type == "SessionEnd" ? nil : sid
                 if tab.sessionId != next { tab.sessionId = next; saveSessionSoon() }
             }
+            PromptRails.shared.hookFired(tab) // the transcript moved: the rail reads it again
         }
         if type == "SessionStart" { return nil } // hooked only to learn the new transcript (/clear, resume)
         attention(id: id, type: type, hook: hook)
