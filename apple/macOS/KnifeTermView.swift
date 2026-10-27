@@ -16,6 +16,7 @@ final class KnifeTermView: LocalProcessTerminalView {
     var onUserInput: (() -> Void)?   // real typing, not ESC[-prefixed reports
     var onInterrupt: (() -> Void)?   // a lone Esc or ^C — stops the agent without a Stop hook
     let ring = OutputRingBuffer()
+    var editing = Editing()          // what you've typed, for Shift+arrows/⌘X/⌘Z (InputEditing.swift)
     private var findBarWatch: NSKeyValueObservation?
 
     // Find matches render as the selection, and the theme's subtle selection
@@ -71,6 +72,7 @@ final class KnifeTermView: LocalProcessTerminalView {
         DispatchQueue.main.async { [weak self] in
             self?.onOutput?()
             self?.scheduleLinkScan()
+            self?.inputOutputArrived()
         }
     }
 
@@ -91,6 +93,7 @@ final class KnifeTermView: LocalProcessTerminalView {
     // Editing chords (TerminalView.keyDown isn't open, so a local monitor):
     //   Shift+Enter        newline instead of submit (ESC CR, Claude Code's binding)
     //   ⌃Delete / ⌘Delete  delete the whole input line (^E ^U)
+    //   Shift+arrows, ⌘X/⌘C/⌘Z/⌘⇧Z  edit what you've typed (editKey)
     //   Delete w/selection erase the highlighted text on the input row
     private var keyMonitor: Any?
 
@@ -98,7 +101,7 @@ final class KnifeTermView: LocalProcessTerminalView {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, event.window === self.window,
                   self.window?.firstResponder === self else { return event }
-            return self.handleKey(event)
+            return self.watchingKey { self.handleKey(event) }
         }
     }
 
@@ -114,6 +117,7 @@ final class KnifeTermView: LocalProcessTerminalView {
             onUserInput?()
             return nil
         }
+        if editKey(event, mods) { return nil }
         if event.keyCode == 51, mods.isEmpty, selection.active {
             deleteSelection()
             return nil
@@ -131,12 +135,14 @@ final class KnifeTermView: LocalProcessTerminalView {
         let row = selection.start.row - t.getTopVisibleRow()
         let cur = t.getCursorLocation()
         guard row == cur.y else { return }
+        // SwiftTerm's selection ends before its end cell — the cells it draws
         let startCol = min(selection.start.col, selection.end.col)
         let endCol = max(selection.start.col, selection.end.col)
+        guard endCol > startCol else { return }
         var seq = ""
-        let dc = (endCol + 1) - cur.x
+        let dc = endCol - cur.x
         if dc != 0 { seq += String(repeating: dc < 0 ? "\u{1b}[D" : "\u{1b}[C", count: min(abs(dc), 400)) }
-        seq += String(repeating: "\u{7f}", count: min(endCol - startCol + 1, 400))
+        seq += String(repeating: "\u{7f}", count: min(endCol - startCol, 400))
         send(txt: seq)
         onUserInput?()
     }
@@ -154,8 +160,11 @@ final class KnifeTermView: LocalProcessTerminalView {
             guard self.bounds.contains(p) else { return event }
             if event.type == .leftMouseDown {
                 self.downPoint = p
+                self.inputMouseDown()
                 return event
             }
+            // A click can move the cursor (ours, SwiftTerm's prompt clicks, the program's own).
+            if hypot(p.x - self.downPoint.x, p.y - self.downPoint.y) <= 3 { self.dropInput() }
             // No mouse-reporting check here: even when the TUI owns the mouse
             // (Claude Code turns reporting on), a click ON a link opens it —
             // that's the whole point. Non-link clicks fall through untouched.
@@ -187,6 +196,7 @@ final class KnifeTermView: LocalProcessTerminalView {
         if data.count == 1, data.first == 0x1b || data.first == 0x03 {
             DispatchQueue.main.async { [weak self] in self?.onInterrupt?() }
         }
+        noteSent(data)
         super.send(source: source, data: data)
     }
 
@@ -355,7 +365,7 @@ final class KnifeTermView: LocalProcessTerminalView {
     }
 
     /// Cell metrics exactly as SwiftTerm computes them for hit testing.
-    private func cellSize() -> (w: CGFloat, h: CGFloat) {
+    func cellSize() -> (w: CGFloat, h: CGFloat) {
         let f = font
         let scale = max(window?.backingScaleFactor ?? 2, 1)
         let w = max(1, (f.advancement(forGlyph: f.glyph(withName: "W")).width * scale).rounded() / scale)
