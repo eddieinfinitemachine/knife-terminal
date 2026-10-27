@@ -426,7 +426,8 @@ final class AppModel: ObservableObject {
     /// `fixed`: the title is a pinned project name (sidebar tab), not whatever the
     /// shell last set via OSC. Absent in files written before it existed.
     struct SavedTab: Codable { var title: String?; var cwd: String?; var cmd: String?; var active: Bool?; var fixed: Bool?
-        var lastActive: Double? }  // epoch seconds; restores active vs dormant across relaunches
+        var lastActive: Double?    // epoch seconds; restores active vs dormant across relaunches
+        var context: String?; var contextPinned: Bool? }
     struct SavedWindow: Codable { var bounds: Bounds?; var tabs: [SavedTab]
         struct Bounds: Codable { var x: Double; var y: Double; var width: Double; var height: Double } }
     struct SavedSession: Codable { var windows: [SavedWindow] }
@@ -455,8 +456,9 @@ final class AppModel: ObservableObject {
             let b = wc.window?.frame ?? .zero
             let tabs = wc.tabs.map { t in
                 SavedTab(title: t.title, cwd: t.currentCwd, cmd: Self.restoreCommand(for: t),
-                         active: t.id == wc.activeId, fixed: t.opts.title != nil,
-                         lastActive: t.lastActivity?.timeIntervalSince1970)
+                         active: t.id == wc.activeId, fixed: t.titleIsFixed,
+                         lastActive: t.lastActivity?.timeIntervalSince1970,
+                         context: t.context, contextPinned: t.contextPinned ? true : nil)
             }
             return SavedWindow(bounds: .init(x: b.origin.x, y: b.origin.y, width: b.width, height: b.height), tabs: tabs)
         }
@@ -508,6 +510,7 @@ final class AppModel: ObservableObject {
                 let tab = wc.addTab(TabOptions(cwd: t.cwd, cmd: t.cmd,
                                                title: fixed ? t.title : nil,
                                                shownTitle: isShellName ? nil : t.title,
+                                               context: t.context, contextPinned: t.contextPinned ?? false,
                                                restoreCmd: t.cmd,
                                                lastActivity: t.lastActive.map(Date.init(timeIntervalSince1970:))),
                                     activateIt: false)

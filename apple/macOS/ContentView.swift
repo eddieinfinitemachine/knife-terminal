@@ -119,6 +119,9 @@ struct SidebarView: View {
     @AppStorage("knife.collapsedSections") private var collapsedRaw = ""
     @State private var renaming: Project?
     @State private var renameText = ""
+    @State private var renamingTab: TabModel?
+    @State private var tabNameText = ""
+    @State private var tabContextText = ""
     /// tab id → the group it was in when the pointer arrived over the tab list.
     @State private var frozen: [Int: SidebarGroup]? = nil
     @FocusState private var searchFocused: Bool
@@ -253,6 +256,15 @@ struct SidebarView: View {
         .onReceive(NotificationCenter.default.publisher(for: .knifeFocusSearch)) { _ in
             if controller.window?.isKeyWindow ?? false { searchFocused = true }
         }
+        .alert("rename tab", isPresented: Binding(
+            get: { renamingTab != nil }, set: { if !$0 { renamingTab = nil } })) {
+            TextField("name", text: $tabNameText)
+            TextField("context", text: $tabContextText, prompt: Text("context — Claude fills this in as it works"))
+            Button("save") { commitTabRename() }
+            Button("cancel", role: .cancel) { renamingTab = nil }
+        } message: {
+            Text(renamingTab?.opts.cwd.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "")
+        }
         .alert("rename project", isPresented: Binding(
             get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("name", text: $renameText)
@@ -282,7 +294,8 @@ struct SidebarView: View {
     private func tabRow(_ tab: TabModel) -> some View {
         TabRow(tab: tab, active: tab.id == controller.activeId,
                activate: { controller.activate(tab.id) },
-               close: { controller.closeTab(tab.id) })
+               close: { controller.closeTab(tab.id) },
+               rename: { startTabRename(tab) })
             .opacity(drag == .tab(tab.id) ? 0.4 : 1.0)
             .onDrag {
                 let id = tab.id
@@ -369,6 +382,30 @@ struct SidebarView: View {
         }
         elsewhere = remote
         sectioned = Projects.sectioned(projects, meta: meta)
+    }
+
+    private func startTabRename(_ tab: TabModel) {
+        tabNameText = tab.title
+        tabContextText = tab.contextPinned ? (tab.context ?? "") : ""
+        renamingTab = tab
+    }
+
+    /// A typed context sticks until it's cleared; cleared, the terminal's titles take over again.
+    private func commitTabRename() {
+        guard let tab = renamingTab else { return }
+        renamingTab = nil
+        let name = tabNameText.trimmingCharacters(in: .whitespaces)
+        if !name.isEmpty, name != tab.title { tab.title = name; tab.renamed = true }
+        let ctx = tabContextText.trimmingCharacters(in: .whitespaces)
+        if ctx.isEmpty {
+            if tab.contextPinned { tab.context = nil }
+            tab.contextPinned = false
+        } else {
+            tab.context = ctx
+            tab.contextPinned = true
+        }
+        AppModel.shared.tabStateChanged(tab)
+        AppModel.shared.saveSessionSoon()
     }
 
     private func commitRename() {
@@ -741,6 +778,7 @@ struct TabRow: View {
     let active: Bool
     let activate: () -> Void
     let close: () -> Void
+    let rename: () -> Void
     @ObservedObject var theme = AppModel.shared.theme
     @State private var hovering = false
     @State private var pulse = false
@@ -758,7 +796,7 @@ struct TabRow: View {
                 .onAppear { pulse = isPulsing }
                 .onChange(of: isPulsing) { _, now in pulse = now }
             Text(tab.emoji).font(.system(size: 12))
-            Text(tab.title).font(ui(11, bold: active)).lineLimit(1)
+            label.font(ui(11, bold: active)).lineLimit(1).truncationMode(.tail)
                 .foregroundStyle(active ? Color.primary : Color.secondary)
             Spacer(minLength: 0)
             if hovering {
@@ -778,8 +816,19 @@ struct TabRow: View {
             if active { Rectangle().fill(accent).frame(width: 3) }
         }
         .contentShape(Rectangle())
-        .onTapGesture(perform: activate)
+        .onTapGesture {
+            // The second click of a double-click renames; the first already activated, which is harmless.
+            if (NSApp.currentEvent?.clickCount ?? 1) > 1 { rename() } else { activate() }
+        }
         .onHover { hovering = $0 }
+        .help(tab.displayTitle)
+    }
+
+    /// "name | context", one Text so the tail truncates the context and never the name.
+    private var label: Text {
+        guard let c = tab.context else { return Text(tab.title) }
+        return Text(tab.title) + Text(" | " + c).font(ui(11))
+            .foregroundColor(active ? Color.secondary : Color.secondary.opacity(0.6))
     }
 
     private var isPulsing: Bool { tab.working && !tab.attention }

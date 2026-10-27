@@ -136,7 +136,8 @@ struct SessionCard: View {
                 .onAppear { pulse = isPulsing }
                 .onChange(of: isPulsing) { _, now in pulse = now }
             Text(tab.emoji).font(.system(size: 12))
-            Text(tab.title).font(ui(12, bold: true)).lineLimit(1)
+            (Text(tab.title) + Text(tab.context.map { " | " + $0 } ?? "").foregroundColor(.secondary))
+                .font(ui(12, bold: true)).lineLimit(1)
             Spacer(minLength: 0)
             Text(statusWord)
                 .font(ui(10))

@@ -155,3 +155,14 @@ Hook events on other sessions also reflowed the groups above "active" mid-press.
 - [x] `make mac` BUILD SUCCEEDED · `make ios` BUILD SUCCEEDED · KnifeKit `swift test` 9/9
 - [ ] Not run live (Claude runs inside Knife — Eddie relaunches): `make install-mac`, then check chat view ⌘⌥C, git panel ⌘⌥B, board segment, a permission prompt in chat, project right-click links
 - [ ] Decide: leave ChatPane/GitPanel in Space Mono (upstream) or move their chrome to `ui()` — left as upstream for now to keep future merges clean
+
+## Tab rows: double-click rename + "name | context" (2026-10-05)
+
+First pass landed on the project list (lower sidebar) — Eddie: "i relaunched it but dont see it". Reverted; "top sidebar" = the open tabs.
+
+- [x] Tab row label is `name | context` (context regular weight, dimmed, tail-truncated; tooltip has the full line); board cards and the phone's tab title carry it too
+- [x] Context comes from Claude Code's own terminal title (its running summary of the conversation, "✳ …"). Project tabs ignored OSC titles before; now a fixed-name tab routes them into `context` (glyph stripped; "Claude Code"/shell names/the tab's own name or directory ignored, last real one stays)
+- [x] Double-click a tab row → "rename tab" alert with name + context fields. A typed context is pinned until cleared; renaming a plain shell fixes its name so titles feed context from then on
+- [x] Persisted in session.json (context, contextPinned, fixed) so restored tabs keep their label until Claude re-titles them
+- [x] Build + `make install-mac` succeeded
+- [ ] Hands-on QA after relaunch: a project tab running Claude shows `name | summary` once Claude titles it; double-click opens the alert on the row clicked; typed context survives a relaunch

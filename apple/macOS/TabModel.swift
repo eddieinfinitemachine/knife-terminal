@@ -7,6 +7,8 @@ struct TabOptions {
     var cmd: String?
     var title: String?       // fixed title (project name, "man ls", …) — OSC titles don't override it
     var shownTitle: String?   // restored display title
+    var context: String?      // restored context line (see TabModel.context)
+    var contextPinned = false
     var restoreCmd: String?
     var lastActivity: Date?   // restored from the session file, or now for a tab opened to work in
 }
@@ -48,6 +50,14 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
     let emoji: String
     let opts: TabOptions
     @Published var title: String
+    /// What the session is on, shown after the name as "name | context". For a tab whose
+    /// name is fixed (a project tab, or a renamed one) it's Claude Code's terminal title —
+    /// its own running summary of the conversation — unless the user wrote one in rename.
+    @Published var context: String?
+    var renamed = false          // the user named a plain shell: its terminal titles now feed `context`
+    var contextPinned = false    // the user wrote the context: terminal titles no longer replace it
+    var titleIsFixed: Bool { opts.title != nil || renamed }
+    var displayTitle: String { context.map { "\(title) | \($0)" } ?? title }
     @Published var working = false
     @Published var attention = false
     @Published var status: TabStatus = .idle { didSet { refreshGroup() } }
@@ -176,6 +186,8 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         self.opts = opts
         self.emoji = opts.cwd != nil ? Emoji.forPath(opts.cwd) : "🔪"
         self.title = opts.shownTitle ?? opts.title ?? (opts.cwd.map { ($0 as NSString).lastPathComponent } ?? "shell \(id)")
+        self.context = opts.context
+        self.contextPinned = opts.contextPinned
         self.view = KnifeTermView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         super.init()
         lastActivity = opts.lastActivity
@@ -264,12 +276,31 @@ extension TabModel: LocalProcessTerminalViewDelegate {
 
     nonisolated func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if self.opts.title == nil, !title.isEmpty {
+            guard let self, !title.isEmpty else { return }
+            if self.titleIsFixed {
+                guard !self.contextPinned, let c = Self.contextLine(from: title, name: self.title, cwd: self.opts.cwd),
+                      c != self.context else { return }
+                self.context = c
+            } else {
                 self.title = title
-                AppModel.shared.tabStateChanged(self)
             }
+            AppModel.shared.tabStateChanged(self)
+            AppModel.shared.saveSessionSoon()
         }
+    }
+
+    /// Claude Code titles the terminal with a short summary of the conversation ("✳ Fix the
+    /// sidebar rename"). The glyph goes; a title that's just the program's or the shell's name,
+    /// the tab's own name, or its directory says nothing and is ignored (the last real one stays).
+    static func contextLine(from title: String, name: String, cwd: String?) -> String? {
+        var s = title.trimmingCharacters(in: .whitespaces)
+        while let f = s.first, !(f.isLetter || f.isNumber) { s.removeFirst() }
+        s = s.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return nil }
+        let generic: Set<String> = ["claude code", "claude", "zsh", "bash", "fish", "sh", "-zsh", "-bash"]
+        if generic.contains(s.lowercased()) || s.caseInsensitiveCompare(name) == .orderedSame { return nil }
+        if let cwd, s == cwd || s == (cwd as NSString).abbreviatingWithTildeInPath || s.hasSuffix("/" + (cwd as NSString).lastPathComponent) { return nil }
+        return s
     }
 
     nonisolated func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {

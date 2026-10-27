@@ -65,3 +65,14 @@ flapped between groups while typing ahead.
   onContinuousHover with set().
 - **Test extracted code, not a copy.** Pull the real enum/struct out of the source file into a
   swift script so the harness can't drift from what ships.
+
+## "Top sidebar" means the tab list (2026-10-05, tab context line)
+
+Eddie asked for double-click rename and a "name | context" line on "a project in the top
+sidebar". I built it on the project list below the tabs; it shipped, he relaunched, and saw
+nothing. The sidebar is tabs on top (each titled with its project's name), projects below.
+
+**Rule:** when a request names a place in the UI, open the view and map the words to the
+actual layout before coding — "project" in the top half is a tab. If the mapping is not
+obvious, state which list is meant in the first line of the reply so the mismatch costs a
+sentence, not a build.
