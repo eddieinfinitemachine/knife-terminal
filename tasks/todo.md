@@ -183,3 +183,16 @@ paste, auto-trust, project folders, text size, contrast nudge, Infinite Machine 
 - [ ] Hands-on QA after Eddie relaunches: ⌘C and Claude's /copy fill the pile; a prompt click in a Claude tab vs a shell vs chat view; the add sheet (⌘↩ saves); repo section after a cd; project menu checkmarks + switching to an open tab
 
 Notes: chat-view copies aren't captured (SwiftUI text selection has no hook). OSC 52 is caught by a pass-through terminalDelegate (ClipboardTap) — a SwiftTerm upgrade that adds delegate methods needs them forwarded there. The project menu's chat list is built in its own view's body, which SwiftUI runs once per right-click, not per render (measured).
+
+### Batch 2 (Eddie: "do the rest" — he already has screenshot paste)
+
+Four agents in parallel worktrees off 30150a2 (~/Code/.worktrees/knife-zach-*), merged back one at a time:
+
+- [x] input (merged 4eda3f6; model tests 94/94) — Shift+arrow/Home/End highlight of typed input, type/Backspace replace it, ⌘X/⌘C, ⌘Z/⌘⇧Z; mouse selection in the input cuts (main screen only, drops tracking when unsure). Depends on Claude Code keeping the terminal cursor on its caret — if not, it switches itself off there without sending wrong keys. One-row highlights; Shift+Enter, clicks, sidebar inserts end tracking
+- [x] textsize — ⌘+/⌘−/⌘0 for every terminal, persisted (36f4d28, on main)
+- [ ] contrast — held: SwiftTerm has no per-cell color hook; the palette-nudge fallback greys out black-on-green badges and misses truecolor. Real fix is ~15 lines in SwiftTerm getAttributes (needs a fork/vendored copy — Eddie's call). Attempt kept on zach-port/contrast-palette
+- [x] sidebar (merged 8e59586; folder tests 55/55) — claude on/off footer switch (⌘T/+ start claude when on; ⌥⌘T and shift-click = shell; right-click + menu); your own root folders; sidebar folders inside status sections (nested, collapsible, drag to file)
+- [x] rail (merged 92b774f; trust+rail tests 91/91) — prompt ticks beside a Claude tab, hover to read, click to scroll back to it; auto-trust folders whose remote owner is yours (~/.knife/config.json trustedOwners) in ~/.claude.json. ~/.knife/config.json pre-created with eddieinfinitemachine, infinite-machine, waldenmeditation (gh account + admin orgs) — the app's own seed would also have trusted cheewee2000 and ramp-public. Gaps: one-line `cd x && claude` races the follow check; SwiftTerm's 500-line scrollback limits how far back the rail can jump outside fullscreen mode
+- [x] Merge all four, `make mac`, re-run every logic test
+- [ ] Infinite Machine look (#8) on top of the merged result — last, since it restyles everything
+- [ ] `make install-mac`; Eddie relaunches; hands-on QA
