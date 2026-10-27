@@ -10,10 +10,18 @@ final class ThemeManager: ObservableObject {
     @Published var mode: ThemeMode {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "theme"); apply() }
     }
+    /// View › Bigger/Smaller Text: one point size for every terminal in every window.
+    @Published var textSize: CGFloat {
+        didSet { UserDefaults.standard.set(Double(textSize), forKey: "textSize"); restyleAll() }
+    }
+    static let defaultTextSize: CGFloat = 13
+    static let textSizes: ClosedRange<CGFloat> = 9...24
     private var appearanceObservation: NSKeyValueObservation?
 
     init() {
         mode = ThemeMode(rawValue: UserDefaults.standard.string(forKey: "theme") ?? "auto") ?? .auto
+        let saved = CGFloat(UserDefaults.standard.double(forKey: "textSize")) // 0 when never set
+        textSize = saved == 0 ? Self.defaultTextSize : Self.clamped(saved)
         appearanceObservation = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in
             DispatchQueue.main.async { self?.restyleAll() }
         }
@@ -32,6 +40,12 @@ final class ThemeManager: ObservableObject {
     func cycle() {
         mode = switch mode { case .auto: .light; case .light: .dark; case .dark: .auto }
     }
+
+    func stepTextSize(_ delta: CGFloat) { textSize = Self.clamped(textSize + delta) }
+    private static func clamped(_ s: CGFloat) -> CGFloat { min(max(s, textSizes.lowerBound), textSizes.upperBound) }
+
+    /// The chat view's text follows the terminal's size, in proportion.
+    var textScale: CGFloat { textSize / Self.defaultTextSize }
 
     func apply() {
         NSApp.appearance = switch mode {
@@ -84,7 +98,13 @@ final class ThemeManager: ObservableObject {
         terminal.nativeForegroundColor = nsColor(t.foreground)
         terminal.caretColor = nsColor(t.cursor)
         terminal.selectedTextBackgroundColor = terminal.findBarVisible ? findHighlight : selectionTint
-        terminal.font = Self.termFont(size: 13)
+        // A new font re-fits the grid and resizes the pty (and soft-resets the terminal and drops the
+        // selection), so only on a real change — not on every theme flip.
+        let font = Self.termFont(size: textSize)
+        if terminal.font != font {
+            terminal.font = font
+            terminal.scheduleLinkScan() // link underlines sit on the old grid until rescanned
+        }
         terminal.refreshLinkOverlay()
         terminal.needsDisplay = true
     }

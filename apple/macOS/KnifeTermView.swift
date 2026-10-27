@@ -382,7 +382,7 @@ final class KnifeTermView: LocalProcessTerminalView {
     private var linkScanPending = false
     static let urlDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 
-    private func scheduleLinkScan() {
+    func scheduleLinkScan() { // also ThemeManager, after a text size change
         guard !linkScanPending else { return }
         linkScanPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in

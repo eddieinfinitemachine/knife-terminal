@@ -40,6 +40,10 @@ struct ChatPane: View {
     }
     private var currentHit: String? { hits.isEmpty ? nil : hits[min(hit, hits.count - 1)] }
 
+    /// Every mono(_:) in this view: message text follows View › Bigger/Smaller Text, scaled
+    /// with the terminal's size (shadows the shared mono, which the sidebar and git panel keep).
+    private func mono(_ size: CGFloat) -> Font { Font.custom("Space Mono", size: size * theme.textScale) }
+
     var body: some View {
         Group {
             if msgs.isEmpty { TerminalPane(controller: controller) } else {

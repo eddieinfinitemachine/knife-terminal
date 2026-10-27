@@ -111,6 +111,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cyc.keyEquivalentModifierMask = [.command, .shift]; cyc.target = self
         view.addItem(withTitle: "Appearance", action: nil, keyEquivalent: "").submenu = appearance
         view.addItem(.separator())
+        view.addItem(withTitle: "Bigger Text", action: #selector(biggerText), keyEquivalent: "+").target = self
+        let bigger = view.addItem(withTitle: "Bigger Text", action: #selector(biggerText), keyEquivalent: "=")
+        bigger.isHidden = true; bigger.allowsKeyEquivalentWhenHidden = true; bigger.target = self // ⌘= without Shift
+        view.addItem(withTitle: "Smaller Text", action: #selector(smallerText), keyEquivalent: "-").target = self
+        view.addItem(withTitle: "Actual Size", action: #selector(actualSize), keyEquivalent: "0").target = self
+        view.addItem(.separator())
         for i in 1...9 {
             let item = view.addItem(withTitle: "Tab \(i)", action: #selector(jumpToTab(_:)), keyEquivalent: "\(i)")
             item.target = self; item.tag = i
@@ -192,12 +198,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppModel.shared.theme.mode = mode
     }
     @objc private func cycleAppearance() { AppModel.shared.theme.cycle() }
+    @objc private func biggerText() { AppModel.shared.theme.stepTextSize(1) }
+    @objc private func smallerText() { AppModel.shared.theme.stepTextSize(-1) }
+    @objc private func actualSize() { AppModel.shared.theme.textSize = ThemeManager.defaultTextSize }
 
-    // Checkmark the active appearance mode.
+    // Checkmark the active appearance mode; grey out text size at either end of its range.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(setAppearance(_:)), let raw = item.representedObject as? String {
             item.state = AppModel.shared.theme.mode.rawValue == raw ? .on : .off
         }
+        let size = AppModel.shared.theme.textSize, sizes = ThemeManager.textSizes
+        if item.action == #selector(biggerText) { return size < sizes.upperBound }
+        if item.action == #selector(smallerText) { return size > sizes.lowerBound }
         return true
     }
 }
