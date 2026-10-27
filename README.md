@@ -38,6 +38,7 @@ Needs Xcode signed into the CW&T Studio developer account (team `L6DVQR8JB9`) �
 
 ## Shortcuts
 - ⌘T new tab · ⌘W close tab (or mini) · ⌘1–9 jump to tab · ⌘⇧[ / ⌘⇧] prev/next tab · ⌘B hide/show sidebar · ⌘N mini popout terminal (plain shell, no tabs/projects)
+- Editing what you've typed on the current line (shell prompt or Claude Code's input), like a text field: Shift+←/→/↑/↓/Home/End highlight it (one row; ↑/↓ go to the start/end), typing or Backspace replaces it, ⌘X / ⌘C cut / copy it (onto the Clipboard pile too), ⌘Z / ⌘⇧Z undo / redo typing, cuts and pastes back to where the line started. A mouse selection inside the typed text works the same in a shell. Knife only does this while it can follow every key you sent — Enter, ^C, Esc, ↑/↓, Tab or a click starts over, and full-screen programs never see it.
 
 ## Layout
 - `apple/project.yml` — XcodeGen spec (the `.xcodeproj` is generated, not committed)
