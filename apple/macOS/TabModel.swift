@@ -202,6 +202,7 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         let shell = Self.userShell()
         var cwd = opts.cwd ?? NSHomeDirectory()
         if !FileManager.default.fileExists(atPath: cwd) { cwd = NSHomeDirectory() }
+        if let cmd = opts.cmd, TrustKeeper.runsClaude(cmd) { TrustKeeper.shared.settle(cwd) } // answer the trust prompt before it appears
         view.startProcess(executable: shell, args: ["-l"], environment: envList, execName: nil, currentDirectory: cwd)
 
         if let cmd = opts.cmd {
@@ -234,6 +235,7 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         view.onOutput = { [weak self] in
             guard let self else { return }
             AppModel.shared.sync?.tabOutput(self)
+            ShellFollower.outputLanded(in: self)
         }
     }
 

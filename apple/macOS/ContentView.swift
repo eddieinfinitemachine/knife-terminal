@@ -60,6 +60,7 @@ struct ContentView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .trailing) { if !controller.showBoard { PromptRail(controller: controller) } } // floats: no reflow
                 if gitPanel {
                     Rectangle().fill(Color.primary.opacity(0.12)).frame(width: 1)
                     GitPanel(controller: controller).frame(width: 280)
