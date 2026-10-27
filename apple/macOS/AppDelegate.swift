@@ -4,7 +4,7 @@ import KnifeKit
 import Sparkle
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     let updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -69,7 +69,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         main.addItem(withTitle: "Knife Terminal", action: nil, keyEquivalent: "").submenu = appMenu
 
         let shell = NSMenu(title: "Shell")
-        shell.addItem(withTitle: "New Tab", action: #selector(newTab), keyEquivalent: "t").target = self
+        // titled by validateMenuItem: what ⌘T does depends on the footer's claude on/off
+        shell.addItem(withTitle: "New Claude Tab", action: #selector(newTab), keyEquivalent: "t").target = self
+        let plain = shell.addItem(withTitle: "New Plain Shell", action: #selector(newPlainTab), keyEquivalent: "t")
+        plain.keyEquivalentModifierMask = [.command, .option]; plain.target = self
         shell.addItem(withTitle: "New Mini Terminal", action: #selector(newMini), keyEquivalent: "n").target = self
         shell.addItem(withTitle: "Close Tab", action: #selector(closeTab), keyEquivalent: "w").target = self
         main.addItem(withTitle: "Shell", action: nil, keyEquivalent: "").submenu = shell
@@ -149,8 +152,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppModel.shared.adoptFolder(url.path)
     }
 
-    @objc private func newTab() {
-        if let wc = front { wc.addTab() } else { AppModel.shared.newWindow() }
+    @objc private func newTab() { openTab(claude: KnifeWindowController.autoClaude) }
+    @objc private func newPlainTab() { openTab(claude: false) }
+    private func openTab(claude: Bool) {
+        if let wc = front { wc.newTab(claude: claude) }
+        else if claude { AppModel.shared.newWindow(withTab: false).newTab(claude: true) }
+        else { AppModel.shared.newWindow() }
     }
     @objc private func newMini() { AppModel.shared.newMiniTerm() }
     @objc private func closeTab() {
@@ -202,8 +209,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func smallerText() { AppModel.shared.theme.stepTextSize(-1) }
     @objc private func actualSize() { AppModel.shared.theme.textSize = ThemeManager.defaultTextSize }
 
-    // Checkmark the active appearance mode; grey out text size at either end of its range.
+    // Checkmark the active appearance mode; say what ⌘T will open; grey out text size at either end of its range.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(newTab) {
+            item.title = KnifeWindowController.autoClaude ? "New Claude Tab" : "New Shell Tab"
+        }
         if item.action == #selector(setAppearance(_:)), let raw = item.representedObject as? String {
             item.state = AppModel.shared.theme.mode.rawValue == raw ? .on : .off
         }
