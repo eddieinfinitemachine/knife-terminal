@@ -197,3 +197,4 @@ Four agents in parallel worktrees off 30150a2 (~/Code/.worktrees/knife-zach-*), 
 - [x] Infinite Machine look (a6aecda): tokens in ThemeManager (Tone / Color.ink…live), Helvetica Now Display Regular only, numbered section labels, solid ink active tab, 48pt header (repo label + chat title), SF Mono terminal, #00ff57 dot
 - [x] All suites green on final main (pile, folders 55, trust/rail 91, input 94); `make install-mac` 19:06
 - [ ] Eddie relaunches; hands-on QA of everything above (none of it has been driven by hand)
+- [x] Board showed "no live agent sessions" with 22 tabs: transcript LRU (16) thrashed against the board's 2 s full scan, re-parsing ~560 MB every pass; SyncPublisher parsed on main. Fixed in e0f0721, installed. Check after relaunch: board fills within ~10 s of first open
