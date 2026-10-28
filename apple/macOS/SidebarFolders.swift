@@ -240,3 +240,25 @@ struct FolderTree: Codable, Equatable {
         }
     }
 }
+
+// ─── Expanded projects: a project row opened to list its recent chats under it ───
+
+enum ExpandedProjects {
+    /// Saved one path per line: a folder name can hold a comma, not (in practice) a newline.
+    static func parse(_ raw: String) -> Set<String> {
+        Set(raw.split(separator: "\n").map(String.init))
+    }
+
+    static func toggled(_ path: String, in raw: String) -> String {
+        var set = parse(raw)
+        if !set.insert(path).inserted { set.remove(path) }
+        return set.sorted().joined(separator: "\n")
+    }
+
+    /// The expanded projects, in list order, whose chats to read now: all of them while the
+    /// sidebar is idle; otherwise only the ones with nothing loaded yet, so what's already drawn
+    /// doesn't change under the pointer.
+    static func toLoad(expanded: Set<String>, listed: [String], loaded: Set<String>, idle: Bool) -> [String] {
+        listed.filter { expanded.contains($0) && (idle || !loaded.contains($0)) }
+    }
+}

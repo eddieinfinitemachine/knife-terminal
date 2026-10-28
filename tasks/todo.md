@@ -198,3 +198,12 @@ Four agents in parallel worktrees off 30150a2 (~/Code/.worktrees/knife-zach-*), 
 - [x] All suites green on final main (pile, folders 55, trust/rail 91, input 94); `make install-mac` 19:06
 - [ ] Eddie relaunches; hands-on QA of everything above (none of it has been driven by hand)
 - [x] Board showed "no live agent sessions" with 22 tabs: transcript LRU (16) thrashed against the board's 2 s full scan, re-parsing ~560 MB every pass; SyncPublisher parsed on main. Fixed in e0f0721, installed. Check after relaunch: board fills within ~10 s of first open
+
+## Expandable projects in the sidebar (2026-10-27)
+
+- [x] ▸ on a hovered project row (trailing, after the star; ▾ stays while open) expands it; persisted in `knife.expandedProjects` (one path per line)
+- [x] Up to 8 recent chats under it, one indent deeper: title, ✓ if a tab has it, age; click = switch to that tab or `claude --resume <id>`; right-click open / copy session id; "no chats yet" when empty
+- [x] Chats read off the main thread; refreshed on rebuild / window key / pointer leaving the sidebar, never while the pointer is on it (only first loads land then)
+- [x] Project row + its chats are one ForEach unit (drag carries them); chats aren't drag sources and a drop on them only ends the drag
+- [x] Not in ⌘K search results or "elsewhere" rows; `make mac` + ExpandedProjects tests 13/13
+- [ ] Hands-on QA after Eddie relaunches: disclosure click doesn't open a tab; drag a project with chats open, drop on its own chats; rows don't shift while hovering

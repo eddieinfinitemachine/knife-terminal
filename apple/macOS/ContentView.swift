@@ -127,6 +127,9 @@ struct SidebarView: View {
     @State private var folderNameText = ""
     @AppStorage("knife.collapsedSections") private var collapsedRaw = ""
     @AppStorage("knife.collapsedFolders") private var collapsedFoldersRaw = ""
+    @AppStorage("knife.expandedProjects") private var expandedRaw = ""   // see ExpandedProjects
+    /// project path → its recent chats, for expanded projects only. Read off the main thread, never in body.
+    @State private var chats: [String: [RecentChat]] = [:]
     @AppStorage("autoClaude") private var autoClaude = true
     @State private var renaming: Project?
     @State private var renameText = ""
@@ -263,7 +266,10 @@ struct SidebarView: View {
                 }
                 .padding(.vertical, 4)
             }
-            .onHover { pointerInside = $0 }
+            .onHover { inside in
+                pointerInside = inside
+                if !inside { refreshChats() } // what was held while the pointer was here catches up
+            }
 
         }
         .onDrop(of: [.text], isTargeted: nil) { _ in
@@ -380,10 +386,13 @@ struct SidebarView: View {
         sectioned.first { $0.0 == section }?.1 ?? []
     }
 
-    private func projectRow(_ p: Project, depth: Int = 0) -> some View {
+    /// `expand`: the row's disclosure; nil leaves it off (search results).
+    private func projectRow(_ p: Project, depth: Int = 0, expand: (() -> Void)? = nil) -> some View {
         ProjectRow(project: p, starred: meta.byPath[p.path]?.starred ?? false,
                    indent: Self.indent(depth),
                    folder: meta.tree?.place[p.path].flatMap { meta.tree?.folder($0)?.name },
+                   expanded: expand != nil && isExpanded(p.path),
+                   toggleExpand: expand,
                    open: { open(project: p) },
                    openChat: { open(project: p, cmd: $0) },
                    toggleStar: { toggleStar(p) },
@@ -392,20 +401,80 @@ struct SidebarView: View {
                    unfile: { saveTree { $0.file(p.path, into: nil) } })
     }
 
-    /// A project in its section (or one of the section's folders), draggable.
+    /// A project in its section (or one of the section's folders), draggable, with its recent
+    /// chats under it when expanded. One unit in the list, so the chats travel with a dragged
+    /// project; only the project row itself is a drag source and a place to drop beside.
     private func sectionRow(_ p: Project, in section: ProjectSection, depth: Int) -> some View {
-        projectRow(p, depth: depth)
-            .opacity(drag == .project(p.path) || draggedFolderHolds(tree.folder(of: p.path, in: section)) ? 0.4 : 1.0)
-            .onDrag {
-                let path = p.path
-                DispatchQueue.main.async { drag = .project(path) }
-                return NSItemProvider(object: "proj:\(path)" as NSString)
+        VStack(alignment: .leading, spacing: 1) {
+            projectRow(p, depth: depth, expand: { toggleExpanded(p.path) })
+                .onDrag {
+                    let path = p.path
+                    DispatchQueue.main.async { drag = .project(path) }
+                    return NSItemProvider(object: "proj:\(path)" as NSString)
+                }
+                .onDrop(of: [.text], delegate: ProjectRowDrop(
+                    targetPath: p.path, targetSection: section,
+                    drag: $drag,
+                    liveMove: liveMove(_:before:in:),
+                    end: endDrag))
+            if isExpanded(p.path) { chatRows(p, depth: depth + 1) }
+        }
+        .opacity(drag == .project(p.path) || draggedFolderHolds(tree.folder(of: p.path, in: section)) ? 0.4 : 1.0)
+    }
+
+    /// An expanded project's recent chats. Nothing until the first read lands — better than a
+    /// "no chats yet" that flips to a list. A drop here only ends the drag, like anywhere else.
+    @ViewBuilder
+    private func chatRows(_ p: Project, depth: Int) -> some View {
+        if let list = chats[p.path] {
+            VStack(alignment: .leading, spacing: 1) {
+                if list.isEmpty {
+                    Text("no chats yet").font(ui(11)).foregroundStyle(.tertiary)
+                        .padding(.leading, 10 + Self.indent(depth)).padding(.trailing, 10).padding(.vertical, 3)
+                }
+                ForEach(list) { c in
+                    ChatRow(chat: c, isOpen: AppModel.shared.tab(session: c.id) != nil, indent: Self.indent(depth),
+                            resume: { ProjectChatsMenu.resume(c.id) { open(project: p, cmd: $0) } })
+                }
             }
-            .onDrop(of: [.text], delegate: ProjectRowDrop(
-                targetPath: p.path, targetSection: section,
-                drag: $drag,
-                liveMove: liveMove(_:before:in:),
-                end: endDrag))
+            .contentShape(Rectangle())
+            .onDrop(of: [.text], delegate: EndDragDrop(drag: $drag, end: endDrag))
+        }
+    }
+
+    static let chatLimit = 8
+
+    private func isExpanded(_ path: String) -> Bool { ExpandedProjects.parse(expandedRaw).contains(path) }
+
+    private func toggleExpanded(_ path: String) {
+        let opening = !isExpanded(path)
+        expandedRaw = ExpandedProjects.toggled(path, in: expandedRaw)
+        if opening { loadChats([path]) } else { chats[path] = nil }
+    }
+
+    /// No pointer on the sidebar and no drag: rows below may change.
+    private var sidebarIdle: Bool { !pointerInside && drag == nil }
+
+    /// Re-reads the expanded projects' chats. While the pointer is on the sidebar only the ones
+    /// with nothing loaded yet are read: rows never appear, vanish or reorder under it.
+    private func refreshChats() {
+        loadChats(ExpandedProjects.toLoad(expanded: ExpandedProjects.parse(expandedRaw), listed: projects.map(\.path),
+                                          loaded: Set(chats.keys), idle: sidebarIdle))
+    }
+
+    /// Lists and titles the chats off the main thread. A result that lands once the pointer is on
+    /// the sidebar only fills a project that had nothing; the rest wait for the next idle refresh.
+    private func loadChats(_ paths: [String]) {
+        guard !paths.isEmpty else { return }
+        let limit = Self.chatLimit
+        Task {
+            let loaded = await Task.detached(priority: .userInitiated) {
+                paths.map { ($0, RecentChats.list(cwd: $0, limit: limit)) }
+            }.value
+            for (path, list) in loaded where isExpanded(path) && (sidebarIdle || chats[path] == nil) {
+                if chats[path] != list { chats[path] = list }
+            }
+        }
     }
 
     private static func indent(_ depth: Int) -> CGFloat { CGFloat(depth) * 12 }
@@ -595,6 +664,7 @@ struct SidebarView: View {
         elsewhere = remote
         sectioned = Projects.sectioned(projects, meta: meta)
         tree = meta.tree ?? FolderTree()
+        refreshChats()
     }
 
     /// The timer's and window focus's rebuild, held off mid-drag: it would reset the live order
@@ -769,6 +839,8 @@ private struct ProjectRow: View {
     let starred: Bool
     var indent: CGFloat = 0     // a step per folder it's inside
     var folder: String? = nil   // the sidebar folder it's filed in, by name
+    var expanded = false        // its recent chats are listed under it
+    var toggleExpand: (() -> Void)? = nil   // nil: no disclosure
     let open: () -> Void
     let openChat: (String) -> Void   // a tab in the project running this claude command
     let toggleStar: () -> Void
@@ -787,6 +859,16 @@ private struct ProjectRow: View {
                     Text(starred ? "★" : "☆").font(ui(11)).foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+            }
+            // Last, so the star appearing on hover never shifts it. A button of its own: the
+            // click stays here and doesn't reach the row's tap (which opens a new chat).
+            if let toggleExpand, hovering || expanded {
+                Button(action: toggleExpand) {
+                    Text(expanded ? "▾" : "▸").font(ui(11)).foregroundStyle(.secondary)
+                        .frame(width: 12).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(expanded ? "hide recent chats" : "show recent chats")
             }
         }
         .padding(.leading, 10 + indent).padding(.trailing, 10).padding(.vertical, 3)
@@ -847,12 +929,45 @@ private struct ProjectChatsMenu: View {
             ForEach(chats) { c in
                 let label = (c.title.count > 60 ? String(c.title.prefix(59)) + "…" : c.title) + "   " + RecentChats.age(c.modified)
                 Toggle(label, isOn: Binding(get: { AppModel.shared.tab(session: c.id) != nil }, set: { _ in
-                    if let tab = AppModel.shared.tab(session: c.id) { AppModel.shared.reveal(tab) }
-                    else { openChat("claude --resume \(c.id)") }
+                    Self.resume(c.id, open: openChat)
                 }))
             }
         }
         Button("new chat", action: newChat)
+    }
+
+    /// To the tab that has this chat, else a new tab resuming it (`open` gets the command).
+    static func resume(_ id: String, open: (String) -> Void) {
+        if let tab = AppModel.shared.tab(session: id) { AppModel.shared.reveal(tab) }
+        else { open("claude --resume \(id)") }
+    }
+}
+
+/// One of an expanded project's recent chats, under its row: title, ✓ when a tab has it, age.
+private struct ChatRow: View {
+    let chat: RecentChat
+    let isOpen: Bool
+    let indent: CGFloat
+    let resume: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(chat.title).font(ui(11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 0)
+            if isOpen { Text("✓").font(ui(9)).foregroundStyle(.secondary) }
+            Text(RecentChats.age(chat.modified)).font(ui(9)).foregroundStyle(.tertiary)
+        }
+        .padding(.leading, 10 + indent).padding(.trailing, 10).padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: resume)
+        .contextMenu {
+            Button("open", action: resume)
+            Button("copy session id") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(chat.id, forType: .string)
+            }
+        }
+        .help(chat.title)
     }
 }
 
@@ -936,6 +1051,22 @@ private struct ProjectRowDrop: DropDelegate {
         guard case .project(let from) = drag, from != targetPath else { return }
         DispatchQueue.main.async { liveMove(from, targetPath, targetSection) }
     }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: drag == nil ? .forbidden : .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        DispatchQueue.main.async { end() }
+        return true
+    }
+}
+
+/// Rows that take no drop of their own (a project's chats): releasing over them still commits
+/// whatever drag is on, and the cursor reads "move" as it does over the rows around them.
+private struct EndDragDrop: DropDelegate {
+    @Binding var drag: SidebarDrag?
+    let end: () -> Void
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         DropProposal(operation: drag == nil ? .forbidden : .move)
