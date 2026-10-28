@@ -221,3 +221,4 @@ Replaces the status groups (needs input / working / ready / active / dormant) in
 - [x] Pure logic in TabGroups.swift; tests 43/43 (scratchpad repo-groups-tests); `make mac` BUILD SUCCEEDED
 - [x] Activating a tab in a folded group (⌘1–9, next/prev, notification, board, continue chat…) unfolds just that group; folding the active tab's group keeps it folded (`TabGroups.revealing`, on change of activeId only); tests 50/50
 - [ ] Hands-on QA after Eddie relaunches (not driven by hand): click rows while statuses change; drag within a group and onto another group's row; fold/unfold, folded header lights up on needs input; cd into another repo in a plain shell; ⌘1–9 vs what's drawn; ⌘1–9 into a folded group opens it; a renamed tab's label
+- [x] Flag for review (eab143e, merged 3f85dbf): right-click project → flag for review / done reviewing; review section above ★, newest first; folders kept. All 7 suites green on main; installed. Hands-on QA open
