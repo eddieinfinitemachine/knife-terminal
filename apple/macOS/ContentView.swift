@@ -118,6 +118,9 @@ struct SidebarView: View {
     @State private var query = ""
     @State private var drag: SidebarDrag?
     @State private var hoverSection: ProjectSection?
+    /// Something is flagged for review, as of the last rebuild — so the review header doesn't
+    /// come or go mid-drag (dragging the last one out leaves it, empty, until the drop).
+    @State private var hasReview = false
     /// The sidebar's folders. A project drag files into them as it goes (like `sectioned`) and
     /// endDrag saves what's on screen.
     @State private var tree = FolderTree()
@@ -217,7 +220,7 @@ struct SidebarView: View {
                         // reflowed the whole list the instant a row was picked up, so the
                         // row under the cursor was no longer the one you grabbed.
                         VStack(alignment: .leading, spacing: 1) {
-                            ForEach(ProjectSection.allCases, id: \.self) { section in
+                            ForEach(ProjectSection.allCases.filter { $0 != .review || hasReview }, id: \.self) { section in
                                 let rows = projects(in: section)
                                 let byPath = Dictionary(rows.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
                                 sectionHeader(section)
@@ -404,6 +407,7 @@ struct SidebarView: View {
     /// `expand`: the row's disclosure; nil leaves it off (search results).
     private func projectRow(_ p: Project, depth: Int = 0, expand: (() -> Void)? = nil) -> some View {
         ProjectRow(project: p, starred: meta.byPath[p.path]?.starred ?? false,
+                   flagged: meta.byPath[p.path]?.flagged,
                    indent: Self.indent(depth),
                    folder: meta.tree?.place[p.path].flatMap { meta.tree?.folder($0)?.name },
                    expanded: expand != nil && isExpanded(p.path),
@@ -411,6 +415,7 @@ struct SidebarView: View {
                    open: { open(project: p) },
                    openChat: { open(project: p, cmd: $0) },
                    toggleStar: { toggleStar(p) },
+                   toggleFlag: { toggleFlag(p) },
                    move: { move(p, to: $0) },
                    rename: { renameText = p.name; renaming = p },
                    unfile: { saveTree { $0.file(p.path, into: nil) } })
@@ -566,6 +571,9 @@ struct SidebarView: View {
             if isCollapsed(section) {
                 Text("▸ \(projects(in: section).count)")
                     .foregroundStyle(.tertiary)
+            } else if section == .review {
+                Text("\(projects(in: section).count)")
+                    .foregroundStyle(.tertiary)
             }
             Spacer(minLength: 0)
         }
@@ -577,8 +585,11 @@ struct SidebarView: View {
         .contentShape(Rectangle())
         .onTapGesture { toggleCollapse(section) }
         .contextMenu {
-            Button("new folder") { startNaming(.new(section, parent: nil)) }
-            Divider()
+            // review holds projects only while they're flagged; their folders stay in their own section
+            if section != .review {
+                Button("new folder") { startNaming(.new(section, parent: nil)) }
+                Divider()
+            }
             rootsMenu
         }
     }
@@ -678,6 +689,7 @@ struct SidebarView: View {
         }
         elsewhere = remote
         sectioned = Projects.sectioned(projects, meta: meta)
+        hasReview = !self.projects(in: .review).isEmpty
         tree = meta.tree ?? FolderTree()
         refreshChats()
     }
@@ -749,9 +761,19 @@ struct SidebarView: View {
         rebuild()
     }
 
+    /// "flag for review" / "done reviewing". Only the flag changes: unflagged, it's back in its
+    /// folder and its place.
+    private func toggleFlag(_ p: Project) {
+        var next = meta
+        next.setFlag(p.path, next.byPath[p.path]?.flagged == nil)
+        Projects.saveMeta(next)
+        rebuild()
+    }
+
     /// The menu's "move to …": to another section, out of its folder; to its own, left where it is.
+    /// A flagged project's own section is its home, the one it's in when not flagged.
     private func move(_ p: Project, to section: ProjectSection) {
-        let current = sectioned.first { $0.1.contains { $0.path == p.path } }?.0
+        let current = Projects.section(of: p, meta: meta, flag: false)
         commitDrop(p.path, into: section,
                    folder: current == section ? tree.folder(of: p.path, in: section) : nil, snapshotOrder: nil)
     }
@@ -784,12 +806,24 @@ struct SidebarView: View {
     /// Hovering a section header parks the row at the top of that section's loose
     /// rows, so a header drop lands where it looks like it will instead of by recency.
     private func liveMove(_ path: String, into section: ProjectSection) {
+        if section == .review { return liveFlag(path) }
         liveMove(path, to: section) { $0.place(path, atTopOf: section, order: &$1) }
     }
 
     /// Hovering a row takes its place: same folder (or loose), right beside it.
     private func liveMove(_ path: String, before targetPath: String, in section: ProjectSection) {
+        if section == .review { return liveFlag(path) }
         liveMove(path, to: section) { $0.place(path, nextTo: targetPath, in: section, order: &$1) }
+    }
+
+    /// Held over review: review is by flag time, not by hand, so a project arriving goes where
+    /// its flag puts it (on top, if it isn't flagged yet) and one already there doesn't move.
+    /// Its folder isn't touched: it waits for the flag to clear.
+    private func liveFlag(_ path: String) {
+        let rows = projects(in: .review)
+        guard !rows.contains(where: { $0.path == path }), let p = projects.first(where: { $0.path == path }) else { return }
+        let order = Projects.reviewOrder(rows + [p], meta: meta).map(\.path)
+        liveMove(path, to: .review) { _, o in o = order }
     }
 
     /// Hovering a folder's name files the row at the top of that folder.
@@ -825,23 +859,7 @@ struct SidebarView: View {
             return
         }
         var next = meta
-        var saved = next.byPath[path] ?? ProjectMeta()
-        if target == .starred {
-            saved.starred = true
-        } else {
-            saved.starred = false
-            saved.override = target == Projects.autoSection(p) ? nil : target
-        }
-        next.byPath[path] = saved
-        var t = next.tree ?? FolderTree()
-        t.file(path, into: folder)
-        next.tree = t
-        for section in ProjectSection.allCases {
-            let key = section.rawValue
-            next.order[key]?.removeAll { $0 == path }
-            if next.order[key]?.isEmpty == true { next.order.removeValue(forKey: key) }
-        }
-        if let snapshotOrder { next.order[target.rawValue] = snapshotOrder }
+        next.drop(p, into: target, folder: folder, order: snapshotOrder)
         Projects.saveMeta(next)
         drag = nil
         hoverSection = nil
@@ -852,6 +870,7 @@ struct SidebarView: View {
 private struct ProjectRow: View {
     let project: Project
     let starred: Bool
+    var flagged: Date? = nil    // flagged for review, when
     var indent: CGFloat = 0     // a step per folder it's inside
     var folder: String? = nil   // the sidebar folder it's filed in, by name
     var expanded = false        // its recent chats are listed under it
@@ -859,6 +878,7 @@ private struct ProjectRow: View {
     let open: () -> Void
     let openChat: (String) -> Void   // a tab in the project running this claude command
     let toggleStar: () -> Void
+    let toggleFlag: () -> Void
     let move: (ProjectSection) -> Void
     let rename: () -> Void
     let unfile: () -> Void
@@ -868,6 +888,7 @@ private struct ProjectRow: View {
         HStack(spacing: 6) {
             Text(Emoji.forPath(project.path)).font(.system(size: 12))
             Text(project.name).font(ui(11)).lineLimit(1)
+            if flagged != nil { Text("⚑").font(ui(9)).foregroundStyle(.secondary).fixedSize() }
             Spacer(minLength: 0)
             if hovering {
                 Button(action: toggleStar) {
@@ -894,6 +915,7 @@ private struct ProjectRow: View {
             ProjectChatsMenu(path: project.path, newChat: open, openChat: openChat)
             Divider()
             Button(starred ? "unstar" : "star", action: toggleStar)
+            Button(flagged != nil ? "done reviewing" : "flag for review", action: toggleFlag)
             Button("rename…", action: rename)
             if let folder { Button("take out of “\(folder)”", action: unfile) }
             Divider()
@@ -903,7 +925,12 @@ private struct ProjectRow: View {
             Divider()
             Self.links(project, local: true)
         }
-        .help(project.path)
+        .help(flagged.map { project.path + "\nflagged " + Self.ago($0) } ?? project.path)
+    }
+
+    static func ago(_ date: Date) -> String {
+        let age = RecentChats.age(date)
+        return age == "now" ? "just now" : age + " ago"
     }
 
     /// Its folder in Finder, its repo's web page (from the git remote; for another Mac's
