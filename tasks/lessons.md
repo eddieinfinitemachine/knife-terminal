@@ -76,3 +76,14 @@ nothing. The sidebar is tabs on top (each titled with its project's name), proje
 actual layout before coding — "project" in the top half is a tab. If the mapping is not
 obvious, state which list is meant in the first line of the reply so the mismatch costs a
 sentence, not a build.
+
+## A restyle is not a feature (2026-10-27, Zach port)
+
+Eddie said "do the rest" of Zach's feature list, which included "Infinite Machine look". I shipped
+it as a whole-app restyle (fonts, colors, header, no emoji, SF Mono) alongside eight real features;
+after relaunching: "i much prefer the way that it looked before." Reverted (09a3c01), features kept.
+
+**Rule:** a change to how the daily-driver app *looks* — type, color, layout chrome — goes in as its
+own commit and is shown before it ships: a screenshot or mock first, or behind a setting that
+defaults to the current look. "Yes to the list" covers behavior; it doesn't sign off on a new
+skin for the whole app.
