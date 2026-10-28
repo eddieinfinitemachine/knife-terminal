@@ -125,12 +125,15 @@ final class SyncPublisher {
                 defer { order += 1 }
                 guard ids.contains(tab.id) else { continue }
                 let cwd = tab.lastReportedCwd ?? tab.opts.cwd
+                // off the main thread: a transcript's first parse can run to hundreds of MB
+                let src = TranscriptReader.source(for: tab, cwd: cwd)
+                let chat = await Task.detached { TranscriptReader.chatData(src) }.value
                 snaps.append(TabSnapshot(tabId: tab.id, title: tab.displayTitle, emoji: tab.emoji,
                                          cwd: cwd, order: order,
                                          cols: tab.cols, rows: tab.rows,
                                          working: tab.working, attention: tab.attention,
                                          styled: tab.view.styledScreen(),
-                                         chat: TranscriptReader.chatData(TranscriptReader.source(for: tab, cwd: cwd))))
+                                         chat: chat))
                 lastFlush[tab.id] = Date()
             }
         }

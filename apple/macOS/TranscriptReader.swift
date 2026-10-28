@@ -75,8 +75,14 @@ enum TranscriptReader {
         }
         c.used = Date()
         cache[path] = c
-        // ponytail: keeps the 16 most recently read sessions' messages in memory; fine for a tab count
-        if cache.count > 16, let old = cache.min(by: { $0.value.used < $1.value.used })?.key { cache[old] = nil }
+        // Past 16 sessions, drop the least recent — but never one read in the last minute. The board
+        // reads every open tab every 2 s; a plain LRU smaller than that set evicted each session just
+        // before its next read, so every pass re-parsed every transcript from byte 0 (22 tabs ≈ 560 MB)
+        // and the board never filled.
+        let fresh = Date().addingTimeInterval(-60)
+        while cache.count > 16, let old = cache.min(by: { $0.value.used < $1.value.used }), old.value.used < fresh {
+            cache[old.key] = nil
+        }
         return c.parser.messages
     }
 
