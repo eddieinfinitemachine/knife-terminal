@@ -57,7 +57,7 @@ final class ThemeManager: ObservableObject {
     }
 
     func restyleAll() {
-        let bg = Tone.paper.ns(dark: isDark)
+        let bg = nsColor(current.background)
         for wc in AppModel.shared.windows {
             wc.window?.backgroundColor = bg
             for tab in wc.tabs { style(terminal: tab.view) }
@@ -73,13 +73,20 @@ final class ThemeManager: ObservableObject {
         NSColor(srgbRed: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1)
     }
 
-    /// SF Mono: the brand has no monospace face, and Apple's own reads closest to Helvetica.
+    var accent: NSColor { nsColor(current.accent) }
+    var attention: NSColor { nsColor(current.attention) }
+    var accentColor: SwiftUI.Color { Color(nsColor: accent) }
+    var attentionColor: SwiftUI.Color { Color(nsColor: attention) }
+
     static func termFont(size: CGFloat) -> NSFont {
-        NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        NSFont(name: "JetBrains Mono", size: size)
+            ?? NSFont(name: "Space Mono", size: size)
+            ?? NSFont(name: "Menlo", size: size)
+            ?? NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
-    /// Subtle tint for ordinary text selection: ink at 14 % on paper, 22 % in the dark.
-    var selectionTint: NSColor { Tone.ink.ns(dark: isDark).withAlphaComponent(isDark ? 0.22 : 0.14) }
+    /// Subtle tint for ordinary text selection.
+    var selectionTint: NSColor { nsColor(current.foreground).withAlphaComponent(isDark ? 0.18 : 0.15) }
 
     /// Loud highlight for find matches (they render as the selection).
     var findHighlight: NSColor { NSColor.systemYellow.withAlphaComponent(0.6) }
@@ -87,11 +94,9 @@ final class ThemeManager: ObservableObject {
     func style(terminal: KnifeTermView) {
         let t = current
         terminal.installColors(t.ansi.map { SwiftTerm.Color(red8: UInt16($0.r), green8: UInt16($0.g), blue8: UInt16($0.b)) })
-        // the 16 ANSI colours stay the terminal palette's; ink, paper and the cursor are the brand's
-        terminal.nativeBackgroundColor = Tone.paper.ns(dark: isDark)
-        terminal.nativeForegroundColor = Tone.ink.ns(dark: isDark)
-        terminal.caretColor = Tone.ink.ns(dark: isDark)
-        terminal.caretTextColor = Tone.paper.ns(dark: isDark)
+        terminal.nativeBackgroundColor = nsColor(t.background)
+        terminal.nativeForegroundColor = nsColor(t.foreground)
+        terminal.caretColor = nsColor(t.cursor)
         terminal.selectedTextBackgroundColor = terminal.findBarVisible ? findHighlight : selectionTint
         // A new font re-fits the grid and resizes the pty (and soft-resets the terminal and drops the
         // selection), so only on a real change — not on every theme flip.
@@ -103,42 +108,4 @@ final class ThemeManager: ObservableObject {
         terminal.refreshLinkOverlay()
         terminal.needsDisplay = true
     }
-}
-
-/// Infinite Machine's tokens (Zach's desktop app): ink on paper, greys between, hairline rules, and
-/// one colour — Electric Green, kept for the dot that says a tab is working or wants you. Each is a
-/// light/dark pair; `Color.ink` and the rest resolve for the appearance they're drawn in, so auto
-/// mode follows the system without a re-render.
-struct Tone {
-    let light: UInt32, dark: UInt32
-
-    static let ink      = Tone(light: 0x000000, dark: 0xfefefe)
-    static let inkSoft  = Tone(light: 0x676767, dark: 0xa6a6a6)
-    static let inkFaint = Tone(light: 0x858789, dark: 0x858789)
-    static let rule     = Tone(light: 0xe0e1e4, dark: 0x262626)
-    static let paper    = Tone(light: 0xfefefe, dark: 0x000000)
-    static let paper2   = Tone(light: 0xf5f5f5, dark: 0x0b0b0b)   // the sidebar
-    static let paper3   = Tone(light: 0xeeeeee, dark: 0x171717)   // drop and hover fills
-    static let live     = Tone(light: 0x00ff57, dark: 0x00ff57)
-
-    func ns(dark: Bool) -> NSColor {
-        let hex = dark ? self.dark : light
-        return NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
-                       blue: CGFloat(hex & 0xff) / 255, alpha: 1)
-    }
-
-    var ns: NSColor {
-        NSColor(name: nil) { a in ns(dark: a.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua) }
-    }
-}
-
-extension SwiftUI.Color {
-    static let ink = Color(nsColor: Tone.ink.ns)
-    static let inkSoft = Color(nsColor: Tone.inkSoft.ns)
-    static let inkFaint = Color(nsColor: Tone.inkFaint.ns)
-    static let rule = Color(nsColor: Tone.rule.ns)
-    static let paper = Color(nsColor: Tone.paper.ns)
-    static let paper2 = Color(nsColor: Tone.paper2.ns)
-    static let paper3 = Color(nsColor: Tone.paper3.ns)
-    static let live = Color(nsColor: Tone.live.ns)
 }

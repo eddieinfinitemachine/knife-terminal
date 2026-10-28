@@ -7,7 +7,6 @@ import AppKit
 struct PromptSections: View {
     let controller: KnifeWindowController
     let repo: RepoKey?   // the active tab's; nil hides the repo section
-    let first: Int       // the prompts label's number; the sections after it count on from there
     @ObservedObject private var store = AppModel.shared.prompts
     @ObservedObject private var pile = AppModel.shared.clips
     @AppStorage("knife.collapsedSections") private var collapsedRaw = ""
@@ -19,7 +18,7 @@ struct PromptSections: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             let global = store.all.filter { $0.repo == nil }
-            header("prompts", number: first, fold: "prompts", count: global.count) {
+            header("prompts", fold: "prompts", count: global.count) {
                 addButton(help: "save a prompt") { editing = PromptDraft() }
             }
             if !isCollapsed("prompts") {
@@ -27,7 +26,7 @@ struct PromptSections: View {
             }
             if let repo {
                 let kept = store.all.filter { $0.repo == repo.key }
-                header(repo.name, number: first + 1, fold: "prompts:repo", count: kept.count, help: "prompts kept to \(repo.key)") {
+                header(repo.name, fold: "prompts:repo", count: kept.count, help: "prompts kept to \(repo.key)") {
                     addButton(help: "save a prompt for \(repo.name)") { editing = PromptDraft(repo: repo) }
                 }
                 if !isCollapsed("prompts:repo") {
@@ -36,7 +35,6 @@ struct PromptSections: View {
             }
             clipboard
         }
-        .preference(key: PromptSectionCount.self, value: shownCount)
         .sheet(item: $editing) { draft in
             PromptEditor(draft: draft, save: save, cancel: { editing = nil })
         }
@@ -79,19 +77,14 @@ struct PromptSections: View {
 
     // ─── Clipboard pile: shown only while it holds something ───
 
-    private var shownClips: [String] { frozenClips ?? pile.clips }
-
-    /// Labels this view draws, so the sidebar numbers the one after them without a gap.
-    private var shownCount: Int { 1 + (repo == nil ? 0 : 1) + (shownClips.isEmpty ? 0 : 1) }
-
     @ViewBuilder
     private var clipboard: some View {
-        let shown = shownClips
+        let shown = frozenClips ?? pile.clips
         if !shown.isEmpty {
             VStack(alignment: .leading, spacing: 1) {
-                header("clipboard", number: first + shownCount - 1, fold: "clipboard", count: shown.count) {
-                    Button(action: pile.clear) { Text("clear").font(ui(11)) }
-                        .buttonStyle(.plain).foregroundStyle(Color.inkFaint)
+                header("clipboard", fold: "clipboard", count: shown.count) {
+                    Button(action: pile.clear) { Text("clear").font(ui(10)) }
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
                         .help("empty the pile")
                 }
                 if !isCollapsed("clipboard") {
@@ -115,24 +108,34 @@ struct PromptSections: View {
 
     // ─── Pieces ───
 
-    /// A numbered section label; click the title to fold.
-    private func header<Trailing: View>(_ title: String, number: Int, fold: String, count: Int, help: String? = nil,
+    /// Same type and spacing as the project section headers; click the title to fold.
+    private func header<Trailing: View>(_ title: String, fold: String, count: Int, help: String? = nil,
                                         @ViewBuilder trailing: () -> Trailing) -> some View {
-        SectionLabel(number: number, title: title, folded: isCollapsed(fold), count: count, trailing: trailing)
-            .contentShape(Rectangle())
-            .onTapGesture { toggleCollapse(fold) }
-            .help(help ?? "")
+        HStack(spacing: 4) {
+            Text(isCollapsed(fold) ? "▸" : "▾").foregroundStyle(.tertiary)
+            Text(title).foregroundStyle(.secondary).lineLimit(1)
+            if isCollapsed(fold), count > 0 { Text("\(count)").foregroundStyle(.tertiary) }
+            Spacer(minLength: 0)
+            trailing()
+        }
+        .font(ui(10))
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+        .contentShape(Rectangle())
+        .onTapGesture { toggleCollapse(fold) }
+        .help(help ?? "")
     }
 
     private func addButton(help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { Text("+").font(ui(14)) }
-            .buttonStyle(.plain).foregroundStyle(Color.ink)
+        Button(action: action) { Text("+").font(ui(12)) }
+            .buttonStyle(.plain).foregroundStyle(.secondary)
             .help(help)
     }
 
     private func row(_ label: String, dim: Bool = false, help: String?, action: @escaping () -> Void) -> some View {
-        Text(label).font(ui(12.5)).lineLimit(1).truncationMode(.tail)
-            .foregroundStyle(dim ? Color.inkFaint : Color.ink)
+        Text(label).font(ui(11)).lineLimit(1).truncationMode(.tail)
+            .foregroundStyle(dim ? Color.secondary.opacity(0.6) : Color.primary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10).padding(.vertical, 3)
             .contentShape(Rectangle())
@@ -181,9 +184,9 @@ private struct PromptEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(draft.promptId == nil ? "save a prompt" : "edit prompt").font(ui(13)).foregroundStyle(Color.ink)
+            Text(draft.promptId == nil ? "save a prompt" : "edit prompt").font(ui(12, bold: true))
             if let r = draft.repoName {
-                Text("kept to “\(r)”").font(ui(10)).foregroundStyle(Color.inkSoft)
+                Text("kept to “\(r)”").font(ui(10)).foregroundStyle(.secondary)
             }
             TextField("name (optional)", text: $draft.name)
                 .textFieldStyle(.roundedBorder).font(ui(11))
@@ -193,9 +196,9 @@ private struct PromptEditor: View {
                 .scrollContentBackground(.hidden)
                 .padding(4)
                 .frame(minHeight: 160)
-                .overlay(Rectangle().stroke(Color.rule, lineWidth: 1))
+                .overlay(Rectangle().stroke(Color.primary.opacity(0.2), lineWidth: 1))
             HStack {
-                Text("⌘↩ saves").font(ui(10)).foregroundStyle(Color.inkFaint)
+                Text("⌘↩ saves").font(ui(10)).foregroundStyle(.tertiary)
                 Spacer()
                 Button("cancel", action: cancel).keyboardShortcut(.cancelAction)
                 // ⌘↩, not ↩: Return has to make a new line in the editor
@@ -208,11 +211,4 @@ private struct PromptEditor: View {
         .frame(width: 420)
         .onAppear { textFocused = true }
     }
-}
-
-/// How many numbered labels PromptSections drew (prompts, the repo's, the clipboard), so the
-/// projects label after them takes the next number.
-struct PromptSectionCount: PreferenceKey {
-    static let defaultValue = 1   // views that don't set it report this too, so the largest wins
-    static func reduce(value: inout Int, nextValue: () -> Int) { value = max(value, nextValue()) }
 }

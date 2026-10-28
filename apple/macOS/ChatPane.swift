@@ -84,6 +84,7 @@ struct ChatPane: View {
 
     private var chat: some View {
         VStack(spacing: 0) {
+            Color.clear.frame(height: 30) // titlebar
             if finding { findBar }
             ScrollViewReader { proxy in
                 ScrollView {
@@ -115,7 +116,7 @@ struct ChatPane: View {
                     withAnimation { proxy.scrollTo(id, anchor: .top) }
                 }
             }
-            Rectangle().fill(Color.rule).frame(height: 1)
+            Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1)
             let model = msgs.last { $0.model != nil }?.model
             if !bars.isEmpty || model != nil {
                 HStack(spacing: 20) {
@@ -153,7 +154,7 @@ struct ChatPane: View {
             VStack(alignment: .trailing, spacing: 2) {
                 plain(m.text, cur).font(mono(12)).foregroundStyle(m.detail == nil ? .primary : .secondary)
                     .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(m.detail == nil ? Color.paper3 : Color.paper2)
+                    .background(accent.opacity(m.detail == nil ? 0.25 : 0.12))
                 if let d = m.detail { Text(d).font(mono(9)).foregroundStyle(.tertiary) }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -191,6 +192,8 @@ struct ChatPane: View {
     // question, or any multi-select, a review screen follows where 1 submits. A lone
     // single-select question submits on its digit.
 
+    private var paper: Color { Color(nsColor: theme.nsColor(theme.current.background)) }
+
     /// Only the newest unanswered question is live — that's the one on the terminal.
     private var liveAskId: String? { msgs.last { $0.ask != nil }.flatMap { $0.answers == nil ? $0.id : nil } }
 
@@ -221,7 +224,7 @@ struct ChatPane: View {
                             }
                             .frame(maxWidth: 520, alignment: .leading)
                         }
-                        .buttonStyle(FootButtonStyle(on: chosen, wrap: true))
+                        .buttonStyle(FootButtonStyle(on: chosen, paper: paper, wrap: true))
                         .disabled(!live || qi != step)
                     }
                     if q.multiSelect, live, qi == step {
@@ -229,20 +232,20 @@ struct ChatPane: View {
                             send(Array(repeating: "\u{1b}[B", count: q.options.count + 1) + ["\r"]) // down to its Submit row
                             askStep[m.id] = step + 1
                         }
-                        .buttonStyle(FootButtonStyle())
+                        .buttonStyle(FootButtonStyle(paper: paper))
                     }
                 }
                 .opacity(live && qi != step && step < qs.count ? 0.55 : 1)
             }
             if live, needsReview, step >= qs.count {
-                Button("submit answers") { send(["1"]) }.buttonStyle(FootButtonStyle(on: true))
+                Button("submit answers") { send(["1"]) }.buttonStyle(FootButtonStyle(on: true, paper: paper))
             }
             Text(m.answers == nil ? (live ? "waiting for your answer" : "not answered")
                  : m.answers!.isEmpty ? "dismissed" : "answered")
                 .font(mono(9)).foregroundStyle(.tertiary)
         }
         .padding(10)
-        .overlay(Rectangle().stroke(live ? ansi(3) : Color.rule, lineWidth: 1))
+        .overlay(Rectangle().stroke(live ? ansi(3) : Color.primary.opacity(0.15), lineWidth: 1))
     }
 
     /// A permission prompt (or any numbered menu) read off the screen; a digit answers it.
@@ -264,7 +267,7 @@ struct ChatPane: View {
                     }
                     .frame(maxWidth: 520, alignment: .leading)
                 }
-                .buttonStyle(FootButtonStyle(wrap: true))
+                .buttonStyle(FootButtonStyle(paper: paper, wrap: true))
             }
             Text("waiting for your answer").font(mono(9)).foregroundStyle(.tertiary)
         }
@@ -363,6 +366,7 @@ struct ChatPane: View {
     // ─── Rich replies: every kind of text gets the terminal theme's color for it ───
     // headings orange · code green · tool names + links gold · quotes grey · you tan
 
+    private var accent: Color { Color(red: 0xB1 / 255.0, green: 0xA5 / 255.0, blue: 0x7E / 255.0) }
     private func ansi(_ i: Int) -> Color { Color(nsColor: theme.nsColor(theme.current.ansi[i])) }
 
     @ViewBuilder
@@ -377,16 +381,16 @@ struct ChatPane: View {
                 .background(Color.primary.opacity(0.05))
         case .item(let depth, let marker, let t):
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(marker).foregroundStyle(Color.inkFaint)
+                Text(marker).foregroundStyle(accent)
                 inline(t, cur)
             }
             .font(mono(12)).padding(.leading, CGFloat(depth) * 18)
         case .quote(let t):
             inline(t, cur).font(mono(12)).foregroundStyle(ansi(6))
                 .padding(.leading, 10)
-                .overlay(alignment: .leading) { Rectangle().fill(Color.ink).frame(width: 2) }
+                .overlay(alignment: .leading) { Rectangle().fill(accent).frame(width: 2) }
         case .rule:
-            Rectangle().fill(Color.rule).frame(height: 1).padding(.vertical, 4)
+            Rectangle().fill(Color.primary.opacity(0.15)).frame(height: 1).padding(.vertical, 4)
         case .table(let rows):
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 4) {
                 ForEach(rows.indices, id: \.self) { i in
@@ -395,7 +399,7 @@ struct ChatPane: View {
                             inline(rows[i][j], cur).foregroundStyle(i == 0 ? ansi(3) : .primary)
                         }
                     }
-                    if i == 0 { Rectangle().fill(Color.rule).frame(height: 1) }
+                    if i == 0 { Rectangle().fill(Color.primary.opacity(0.15)).frame(height: 1) }
                 }
             }
             .font(mono(11))

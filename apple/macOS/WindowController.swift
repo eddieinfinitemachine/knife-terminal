@@ -35,7 +35,7 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
         win.isReleasedWhenClosed = false
         self.init(window: win)
         win.delegate = self
-        win.backgroundColor = Tone.paper.ns(dark: AppModel.shared.theme.isDark)
+        win.backgroundColor = AppModel.shared.theme.nsColor(AppModel.shared.theme.current.background)
         win.contentView = NSHostingView(rootView: ContentView(controller: self))
         if bounds != nil { win.setFrame(rect, display: true) } else { win.center() }
     }

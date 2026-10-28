@@ -19,7 +19,7 @@ final class MiniTermController: NSWindowController, NSWindowDelegate {
         win.delegate = self
         win.isReleasedWhenClosed = false
         AppModel.shared.theme.style(terminal: term)
-        win.backgroundColor = Tone.paper.ns(dark: AppModel.shared.theme.isDark)
+        win.backgroundColor = AppModel.shared.theme.nsColor(AppModel.shared.theme.current.background)
         if let content = win.contentView {
             term.frame = content.bounds
             term.autoresizingMask = [.width, .height]

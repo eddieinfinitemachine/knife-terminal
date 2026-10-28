@@ -10,13 +10,10 @@ extension Notification.Name {
     static let knifeChatInsert = Notification.Name("knife.chatInsert") // object: window controller; userInfo["text"]: String
 }
 
-// Chrome type: Helvetica Now Display at Regular only — hierarchy comes from size and grey, never
-// weight. Helvetica Now Text (bundled) where Display isn't installed, then Helvetica Neue. The
-// terminal grid stays monospace.
-private let uiFace = ["HelveticaNowDisplay-Regular", "HelveticaNowText-Regular", "HelveticaNeue"]
-    .first { NSFont(name: $0, size: 12) != nil } ?? "HelveticaNeue"
-
-func ui(_ size: CGFloat) -> Font { Font.custom(uiFace, size: size) }
+// Chrome type: Helvetica Now Text (system-installed); the terminal grid stays monospace.
+func ui(_ size: CGFloat, bold: Bool = false) -> Font {
+    Font.custom(bold ? "HelveticaNowText-Medium" : "HelveticaNowText-Regular", size: size)
+}
 
 // Upstream's chat view and git panel are set in Space Mono.
 func mono(_ size: CGFloat, bold: Bool = false) -> Font {
@@ -25,6 +22,7 @@ func mono(_ size: CGFloat, bold: Bool = false) -> Font {
 
 struct ContentView: View {
     @ObservedObject var controller: KnifeWindowController
+    @ObservedObject var theme = AppModel.shared.theme
     @AppStorage("sidebarCollapsed") private var collapsed = false
     @AppStorage("sideWidth") private var sideWidth: Double = 220
     @AppStorage("gitPanel") private var gitPanel = false
@@ -37,7 +35,7 @@ struct ContentView: View {
                     SidebarView(controller: controller)
                         .frame(width: max(160, min(480, sideWidth)))
                     Rectangle()
-                        .fill(Color.rule)
+                        .fill(Color.primary.opacity(0.12))
                         .frame(width: 1)
                         .overlay(
                             Rectangle().fill(Color.clear).frame(width: 7)
@@ -51,31 +49,30 @@ struct ContentView: View {
                                 }
                         )
                 }
-                VStack(spacing: 0) {
-                    if !controller.showBoard { TabHeader(controller: controller, clearLights: collapsed) }
-                    Group {
-                        if controller.showBoard {
-                            BoardView(controller: controller)
-                        } else if chatView, let tab = controller.activeTab {
-                            ChatPane(controller: controller, tab: tab)
-                                .id(tab.id) // fresh state per tab: echoes, opened runs, find never carry over
-                        } else {
-                            TerminalPane(controller: controller)
-                        }
+                Group {
+                    if controller.showBoard {
+                        BoardView(controller: controller)
+                    } else if chatView, let tab = controller.activeTab {
+                        ChatPane(controller: controller, tab: tab)
+                            .id(tab.id) // fresh state per tab: echoes, opened runs, find never carry over
+                    } else {
+                        TerminalPane(controller: controller)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .overlay(alignment: .trailing) { if !controller.showBoard { PromptRail(controller: controller) } } // floats: no reflow
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .trailing) { if !controller.showBoard { PromptRail(controller: controller) } } // floats: no reflow
                 if gitPanel {
-                    Rectangle().fill(Color.rule).frame(width: 1)
+                    Rectangle().fill(Color.primary.opacity(0.12)).frame(width: 1)
                     GitPanel(controller: controller).frame(width: 280)
                 }
             }
             FooterBar(controller: controller)
         }
-        .background(Color.paper)
+        .background(bg)
         .ignoresSafeArea()
     }
+
+    private var bg: Color { Color(nsColor: theme.nsColor(theme.current.background)) }
 }
 
 // ─── Terminal host: shows the active tab's NSView ───
@@ -109,107 +106,11 @@ struct TerminalPane: NSViewRepresentable {
     }
 }
 
-// ─── Header: which chat this is, above the terminal ───
-// The project (its repo, when it's in one) as a small label, the chat's title large under it:
-// Claude Code's running title once there is one, else the tab's own name, which then stands
-// alone unless the repo says something it doesn't. A fixed height, so a title coming or going
-// never reflows the terminal; with the sidebar hidden it starts clear of the traffic lights.
-
-struct TabHeader: View {
-    @ObservedObject var controller: KnifeWindowController
-    let clearLights: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Group {
-                if let tab = controller.activeTab { HeaderTitle(tab: tab).id(tab.id) }
-            }
-            .padding(.leading, clearLights ? 80 : 16).padding(.trailing, 16)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            Rectangle().fill(Color.rule).frame(height: 1)
-        }
-        .frame(height: 48)
-        .background(Color.paper)
-    }
-}
-
-private struct HeaderTitle: View {
-    @ObservedObject var tab: TabModel
-    @State private var project: String?
-
-    var body: some View {
-        let title = tab.context ?? tab.title
-        VStack(alignment: .leading, spacing: 2) {
-            if let project, project != title {
-                Text(project.uppercased()).font(ui(10.5)).tracking(0.84)
-                    .foregroundStyle(Color.inkFaint).lineLimit(1)
-            }
-            Text(title).font(ui(20)).tracking(-0.2)
-                .foregroundStyle(Color.ink).lineLimit(1).truncationMode(.tail)
-        }
-        .task {
-            // now, then every 10 s: a cd into or out of a repo shows up here
-            while !Task.isCancelled {
-                refresh()
-                try? await Task.sleep(for: .seconds(10))
-            }
-        }
-    }
-
-    private func refresh() {
-        let next = tab.currentCwd.map { Repos.key(for: $0)?.name ?? ($0 as NSString).lastPathComponent }
-        if next != project { project = next }
-    }
-}
-
-/// A top-level sidebar section's label, numbered in display order on an ink hairline: "01 · TABS".
-/// One that folds shows its arrow where the "·" goes (and its count while folded); trailing
-/// controls sit at the right end of the line.
-struct SectionLabel<Trailing: View>: View {
-    let number: Int
-    let title: String
-    let folded: Bool?   // nil: doesn't fold
-    let count: Int
-    let top: CGFloat
-    let trailing: Trailing
-
-    init(number: Int, title: String, folded: Bool? = nil, count: Int = 0, top: CGFloat = 10,
-         @ViewBuilder trailing: () -> Trailing) {
-        self.number = number; self.title = title; self.folded = folded; self.count = count; self.top = top
-        self.trailing = trailing()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Rectangle().fill(Color.ink).frame(height: 1)
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(String(format: "%02d", number)).font(ui(10)).tracking(0.8).foregroundStyle(Color.inkFaint)
-                Text(folded.map { $0 ? "▸" : "▾" } ?? "·").font(ui(folded == nil ? 10 : 8)).foregroundStyle(Color.inkFaint)
-                Text(title.uppercased()).font(ui(10)).tracking(0.8).foregroundStyle(Color.inkSoft).lineLimit(1)
-                if folded == true, count > 0 { Text("\(count)").font(ui(10)).foregroundStyle(Color.inkFaint) }
-                Spacer(minLength: 0)
-                trailing
-            }
-        }
-        .padding(.horizontal, 10).padding(.top, top).padding(.bottom, 2)
-    }
-}
-
-extension SectionLabel where Trailing == EmptyView {
-    init(number: Int, title: String, top: CGFloat = 10) {
-        self.init(number: number, title: title, top: top, trailing: { EmptyView() })
-    }
-}
-
-private extension String {
-    /// "needs input" → "Needs input": group headers are sentence case.
-    var sentenceCased: String { prefix(1).uppercased() + dropFirst() }
-}
-
 // ─── Sidebar ───
 
 struct SidebarView: View {
     @ObservedObject var controller: KnifeWindowController
+    @ObservedObject var theme = AppModel.shared.theme
     @State private var projects: [Project] = []
     @State private var meta = Projects.SidebarMeta()
     @State private var sectioned: [(ProjectSection, [Project])] = []
@@ -236,7 +137,6 @@ struct SidebarView: View {
     @State private var frozen: [Int: SidebarGroup]? = nil
     @State private var activeRepo: RepoKey?   // the active tab's, for its prompt section
     @State private var pointerInside = false
-    @State private var promptLabels = 1   // numbered labels PromptSections draws; projects comes next
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -245,7 +145,6 @@ struct SidebarView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    SectionLabel(number: 1, title: "tabs", top: 2)
                     // Tabs grouped (needs input first); manual order kept within a group.
                     // Headers only appear once something isn't dormant, so a window of
                     // plain shells looks like a plain list.
@@ -274,10 +173,10 @@ struct SidebarView: View {
                     // claude or a plain shell per the footer switch; shift-click for a plain shell once
                     Button(action: { controller.newTab(claude: autoClaude && !NSEvent.modifierFlags.contains(.shift)) }) {
                         HStack(spacing: 6) {
-                            Text("+").font(ui(14))
-                            Text("new tab").font(ui(12.5))
+                            Text("+").font(ui(12))
+                            Text("new tab").font(ui(11))
                         }
-                        .foregroundStyle(Color.inkSoft)
+                        .foregroundStyle(.secondary)
                         .padding(.horizontal, 10).padding(.vertical, 4)
                     }
                     .buttonStyle(.plain)
@@ -291,20 +190,16 @@ struct SidebarView: View {
                             .keyboardShortcut("t", modifiers: [.command, .option])
                     }
 
-                    PromptSections(controller: controller, repo: activeRepo, first: 2)
-                        .onPreferenceChange(PromptSectionCount.self) { promptLabels = $0 }
+                    PromptSections(controller: controller, repo: activeRepo)
 
-                    SectionLabel(number: 2 + promptLabels, title: "projects")
+                    Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1)
+                        .padding(.vertical, 6)
 
-                    // a plain paper field on the grey sidebar, no border
                     TextField("⌘K search projects", text: $query)
                         .textFieldStyle(.plain)
-                        .font(ui(12))
-                        .foregroundStyle(Color.ink)
+                        .font(ui(11))
                         .focused($searchFocused)
-                        .padding(.horizontal, 8).padding(.vertical, 5)
-                        .background(Color.paper)
-                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .padding(.horizontal, 10).padding(.bottom, 4)
                         .onSubmit {
                             if let first = query.trimmingCharacters(in: .whitespaces).isEmpty
                                 ? projects.first : filtered.first {
@@ -350,10 +245,12 @@ struct SidebarView: View {
                     ForEach(filteredElsewhere) { p in
                         Button(action: { AppModel.shared.openProject(p.path, cmd: "claude"); query = ""; searchFocused = false }) {
                             HStack(spacing: 6) {
-                                Text(p.name).font(ui(12.5)).foregroundStyle(Color.inkSoft).lineLimit(1)
+                                Text(Emoji.forPath(p.path)).font(.system(size: 12))
+                                Text(p.name).font(ui(11)).lineLimit(1)
                                 Spacer(minLength: 0)
-                                Text("clone").font(ui(10.5)).foregroundStyle(Color.inkFaint)
+                                Text("clone").font(ui(9))
                             }
+                            .foregroundStyle(.secondary)
                             .padding(.horizontal, 10).padding(.vertical, 3)
                             .contentShape(Rectangle())
                         }
@@ -369,7 +266,6 @@ struct SidebarView: View {
             .onHover { pointerInside = $0 }
 
         }
-        .background(Color.paper2)
         .onDrop(of: [.text], isTargeted: nil) { _ in
             endDrag()
             return true
@@ -469,14 +365,14 @@ struct SidebarView: View {
 
     private func tabGroupHeader(_ group: SidebarGroup, count: Int) -> some View {
         HStack(spacing: 4) {
-            Text(group.rawValue.sentenceCased)
-            Text("\(count)")
+            Text(group.rawValue)
+                .foregroundStyle(group == .needsInput ? theme.attentionColor : Color.secondary)
+            Text("\(count)").foregroundStyle(.tertiary)
             Spacer(minLength: 0)
         }
-        .font(ui(11))
-        .foregroundStyle(Color.inkFaint)
+        .font(ui(10))
         .padding(.horizontal, 10)
-        .padding(.top, 5)
+        .padding(.top, 8)
         .padding(.bottom, 2)
     }
 
@@ -519,21 +415,20 @@ struct SidebarView: View {
     private func folderHeader(_ f: SidebarFolder, depth: Int, count: Int) -> some View {
         let shut = isFolderCollapsed(f.id)
         return HStack(spacing: 6) {
-            Text(shut ? "▸" : "▾").font(ui(8)).frame(width: 14)
-            Text(f.name).font(ui(11)).lineLimit(1)
-            if shut { Text("\(count)").font(ui(11)) }
+            Text(shut ? "▸" : "▾").font(ui(10)).foregroundStyle(.tertiary).frame(width: 14)
+            Text(f.name).font(ui(11)).foregroundStyle(.secondary).lineLimit(1)
+            if shut { Text("\(count)").font(ui(10)).foregroundStyle(.tertiary) }
             Spacer(minLength: 0)
         }
-        .foregroundStyle(Color.inkFaint)
         .padding(.leading, 10 + Self.indent(depth)).padding(.trailing, 10)
         .frame(height: Self.folderRowHeight)
         // drop feedback draws over the row, never beside it: nothing reflows mid-drag
-        .background(folderSpot == .into(f.id) ? Color.paper3 : Color.clear)
+        .background(folderSpot == .into(f.id) ? theme.accentColor.opacity(0.15) : Color.clear)
         .overlay(alignment: .top) {
-            if folderSpot == .before(f.id) { Rectangle().fill(Color.ink).frame(height: 2) }
+            if folderSpot == .before(f.id) { Rectangle().fill(theme.accentColor).frame(height: 2) }
         }
         .overlay(alignment: .bottom) {
-            if folderSpot == .after(f.id) { Rectangle().fill(Color.ink).frame(height: 2) }
+            if folderSpot == .after(f.id) { Rectangle().fill(theme.accentColor).frame(height: 2) }
         }
         .opacity(draggedFolderHolds(f.id) ? 0.4 : 1.0)
         .contentShape(Rectangle())
@@ -581,18 +476,20 @@ struct SidebarView: View {
     }
 
     private func sectionHeader(_ section: ProjectSection) -> some View {
-        let shut = isCollapsed(section)
-        return HStack(spacing: 6) {
-            Text(shut ? "▸" : "▾").font(ui(8))
-            Text(section == .starred ? "★" : section.rawValue.sentenceCased).font(ui(11))
-            if shut { Text("\(projects(in: section).count)").font(ui(11)) }
+        HStack(spacing: 4) {
+            Text(section == .starred ? "★" : section.rawValue)
+                .foregroundStyle(.secondary)
+            if isCollapsed(section) {
+                Text("▸ \(projects(in: section).count)")
+                    .foregroundStyle(.tertiary)
+            }
             Spacer(minLength: 0)
         }
-        .foregroundStyle(Color.inkFaint)
+        .font(ui(10))
         .padding(.horizontal, 10)
-        .padding(.top, 5)
+        .padding(.top, 8)
         .padding(.bottom, 2)
-        .background(hoverSection == section ? Color.paper3 : Color.clear)
+        .background(hoverSection == section ? theme.accentColor.opacity(0.15) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture { toggleCollapse(section) }
         .contextMenu {
@@ -882,11 +779,12 @@ private struct ProjectRow: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(project.name).font(ui(12.5)).foregroundStyle(Color.ink).lineLimit(1)
+            Text(Emoji.forPath(project.path)).font(.system(size: 12))
+            Text(project.name).font(ui(11)).lineLimit(1)
             Spacer(minLength: 0)
             if hovering {
                 Button(action: toggleStar) {
-                    Text(starred ? "★" : "☆").font(ui(11)).foregroundStyle(Color.inkFaint)
+                    Text(starred ? "★" : "☆").font(ui(11)).foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
             }
@@ -985,7 +883,7 @@ struct JobBox: View {
     @State private var request = ""
 
     var body: some View {
-        Rectangle().fill(Color.rule).frame(height: 1).padding(.vertical, 6)
+        Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1).padding(.vertical, 6)
         TextField("ask — routed to a project, run in a job tab", text: $request, axis: .vertical)
             .textFieldStyle(.plain).font(ui(11)).lineLimit(1...4)
             .padding(.horizontal, 10).padding(.bottom, 4)
@@ -1135,8 +1033,8 @@ private struct FolderDrop: DropDelegate {
 }
 
 // ─── Footer: spans the full window width, below sidebar + terminal ───
-// Small sentence-case words, in order view · panels · find · context · setup; a toggle that's on
-// reads in ink, off in grey. Tooltips carry the keyboard shortcut.
+// Bordered square buttons in groups — view · panels · find · context · setup; a toggle that's
+// on draws inverted. Tooltips carry the keyboard shortcut.
 
 struct FooterBar: View {
     @ObservedObject var controller: KnifeWindowController
@@ -1150,77 +1048,62 @@ struct FooterBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Rectangle().fill(Color.rule).frame(height: 1)
-            HStack(spacing: 18) {
-                btn("Terminal", on: !chatView && !controller.showBoard, help: "terminal view  ⌘⌥C") { controller.showBoard = false; chatView = false }
-                btn("Chat", on: chatView && !controller.showBoard, help: "chat view  ⌘⌥C") { controller.showBoard = false; chatView = true }
-                btn("Board", on: controller.showBoard, help: "session board  ⌘⇧B") { controller.showBoard = true }
-                btn("Sidebar", on: !sidebarCollapsed, help: "sidebar  ⌘B") { sidebarCollapsed.toggle() }
-                btn("Git", on: gitPanel, help: "git panel  ⌘⌥B") { gitPanel.toggle() }
-                btn("Find", help: "find in this tab  ⌘F · next ⌘G") {
+            Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1)
+            HStack(spacing: 8) {
+                HStack(spacing: -1) { // segmented: shared borders
+                    btn("terminal", on: !chatView && !controller.showBoard, help: "terminal view  ⌘⌥C") { controller.showBoard = false; chatView = false }
+                    btn("chat", on: chatView && !controller.showBoard, help: "chat view  ⌘⌥C") { controller.showBoard = false; chatView = true }
+                    btn("board", on: controller.showBoard, help: "session board  ⌘⇧B") { controller.showBoard = true }
+                }
+                sep
+                btn("sidebar", on: !sidebarCollapsed, help: "sidebar  ⌘B") { sidebarCollapsed.toggle() }
+                btn("git", on: gitPanel, help: "git panel  ⌘⌥B") { gitPanel.toggle() }
+                sep
+                btn("find", help: "find in this tab  ⌘F · next ⌘G") {
                     let item = NSMenuItem()
                     item.tag = NSTextFinder.Action.showFindInterface.rawValue
                     (NSApp.delegate as? AppDelegate)?.find(item)
                 }
-                btn("Global ctx", on: ctxScope == "global", help: "context shared by every session") {
+                sep
+                btn("global ctx", on: ctxScope == "global", help: "context shared by every session") {
                     ctxScope = ctxScope == "global" ? nil : "global"
                 }
                 .popover(isPresented: Binding(get: { ctxScope == "global" }, set: { if !$0 { ctxScope = nil } })) {
                     ContextPanel(scope: "global", cwd: nil)
                 }
-                btn("Tab ctx", on: ctxScope == "session", help: "context for this tab's session") {
+                btn("tab ctx", on: ctxScope == "session", help: "context for this tab's session") {
                     ctxScope = ctxScope == "session" ? nil : "session"
                 }
                 .popover(isPresented: Binding(get: { ctxScope == "session" }, set: { if !$0 { ctxScope = nil } })) {
                     ContextPanel(scope: "session", cwd: controller.activeTab?.currentCwd)
                 }
-                btn("Theme: " + theme.mode.rawValue, help: "cycle auto · light · dark") { theme.cycle() }
-                btn(autoClaude ? "Claude on" : "Claude off", on: autoClaude,
+                sep
+                btn("theme: " + theme.mode.rawValue, help: "cycle auto · light · dark") { theme.cycle() }
+                btn(autoClaude ? "claude on" : "claude off", on: autoClaude,
                     help: autoClaude ? "new tabs start Claude Code — ⌥⌘T or shift-click “new tab” for a plain shell"
                                      : "new tabs open a plain shell — click to start Claude Code in them") { autoClaude.toggle() }
-                btn(hooksOn ? "Alerts on" : "Alerts off", on: hooksOn, help: "Claude Code hooks for working/attention alerts") {
+                btn(hooksOn ? "alerts on" : "alerts off", on: hooksOn, help: "Claude Code hooks for working/attention alerts") {
                     _ = HooksInstaller.install(); hooksOn = HooksInstaller.installed()
                 }
-                btn("Set default", help: "make Knife the default terminal") { DefaultTerminal.register() }
+                btn("set default", help: "make Knife the default terminal") { DefaultTerminal.register() }
                 Spacer(minLength: 8)
                 Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
-                    .font(ui(11)).foregroundStyle(Color.inkFaint).fixedSize()
+                    .font(ui(9)).foregroundStyle(.tertiary).fixedSize()
             }
-            .padding(.horizontal, 12).padding(.vertical, 6)
+            .padding(.horizontal, 10).padding(.vertical, 5)
         }
-        .background(Color.paper2)
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { n in
             guard (n.object as? NSWindow) === controller.window else { return }
             hooksOn = HooksInstaller.installed()
         }
     }
 
+    private var sep: some View { Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14) }
+
     private func btn(_ label: String, on: Bool = false, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) { Text(label) }
-            .buttonStyle(FootLinkStyle(on: on))
+            .buttonStyle(FootButtonStyle(on: on, paper: Color(nsColor: theme.nsColor(theme.current.background))))
             .help(help)
-    }
-}
-
-/// The footer's words: ink when on, grey when off; hover and press fade.
-private struct FootLinkStyle: ButtonStyle {
-    let on: Bool
-
-    func makeBody(configuration: Configuration) -> some View { Face(configuration: configuration, on: on) }
-
-    private struct Face: View {
-        let configuration: Configuration
-        let on: Bool
-        @State private var hover = false
-
-        var body: some View {
-            configuration.label
-                .font(ui(11)).lineLimit(1).fixedSize()
-                .foregroundStyle(on ? Color.ink : Color.inkSoft)
-                .opacity(configuration.isPressed ? 0.4 : hover ? 0.55 : 1)
-                .contentShape(Rectangle())
-                .onHover { hover = $0 }
-        }
     }
 }
 
@@ -1228,24 +1111,26 @@ private struct FootLinkStyle: ButtonStyle {
 /// `wrap` lets a long label (the chat's question options) wrap instead of staying one line.
 struct FootButtonStyle: ButtonStyle {
     var on = false
+    let paper: Color
     var wrap = false
 
-    func makeBody(configuration: Configuration) -> some View { Face(configuration: configuration, on: on, wrap: wrap) }
+    func makeBody(configuration: Configuration) -> some View { Face(configuration: configuration, on: on, paper: paper, wrap: wrap) }
 
     private struct Face: View {
         let configuration: Configuration
         let on: Bool
+        let paper: Color
         let wrap: Bool
         @State private var hover = false
 
         var body: some View {
             configuration.label
                 .font(ui(10)).lineLimit(wrap ? nil : 1).fixedSize(horizontal: !wrap, vertical: true)
-                .foregroundStyle(on ? Color.paper : Color.ink)
+                .foregroundStyle(on ? paper : Color.primary)
                 .padding(.horizontal, 8).padding(.vertical, 3)
-                .background(on ? Color.ink.opacity(configuration.isPressed ? 0.7 : 1)
-                               : configuration.isPressed ? Color.rule : hover ? Color.paper3 : Color.clear)
-                .overlay(Rectangle().stroke(on ? Color.ink : Color.inkFaint, lineWidth: 1))
+                .background(on ? Color.primary.opacity(configuration.isPressed ? 0.7 : 0.9)
+                               : Color.primary.opacity(configuration.isPressed ? 0.16 : hover ? 0.07 : 0))
+                .overlay(Rectangle().stroke(Color.primary.opacity(on ? 0.9 : 0.35), lineWidth: 1))
                 .contentShape(Rectangle())
                 .onHover { hover = $0 }
         }
@@ -1258,45 +1143,42 @@ struct TabRow: View {
     let activate: () -> Void
     let close: () -> Void
     let rename: () -> Void
+    @ObservedObject var theme = AppModel.shared.theme
     @State private var hovering = false
     @State private var pulse = false
 
-    /// One line: the name in ink, then its context in grey at the right end. The active tab is a
-    /// solid ink block with paper text. A fixed height, so the × coming and going never moves a row.
+    private var accent: Color { theme.accentColor }
+    private var signalOrange: Color { theme.attentionColor }
+
     var body: some View {
         HStack(spacing: 6) {
-            // green: blinking while it works, steady once it wants you
             Circle()
-                .fill(tab.attention || tab.working ? Color.live : .clear)
+                .fill(tab.attention ? signalOrange : (tab.working ? accent : .clear))
                 .frame(width: 6, height: 6)
                 .opacity(isPulsing && pulse ? 0.25 : 1.0)
                 .animation(isPulsing ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : .default, value: pulse)
                 .onAppear { pulse = isPulsing }
                 .onChange(of: isPulsing) { _, now in pulse = now }
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                // the name wins the room; the context truncates first
-                Text(tab.title).font(ui(13)).lineLimit(1).truncationMode(.tail).layoutPriority(1)
-                    .foregroundStyle(active ? Color.paper : Color.ink)
-                Spacer(minLength: 0)
-                if let c = tab.context {
-                    Text(c).font(ui(10.5)).lineLimit(1).truncationMode(.tail)
-                        .foregroundStyle(active ? Color.paper.opacity(0.6) : Color.inkFaint)
+            Text(tab.emoji).font(.system(size: 12))
+            label.font(ui(11, bold: active)).lineLimit(1).truncationMode(.tail)
+                .foregroundStyle(active ? Color.primary : Color.secondary)
+            Spacer(minLength: 0)
+            if hovering {
+                Button(action: close) {
+                    Text("×").font(ui(11)).foregroundStyle(.secondary)
                 }
-                if hovering || active {
-                    Button(action: close) {
-                        Text("×").font(ui(13)).foregroundStyle(active ? Color.paper : Color.inkFaint)
-                    }
-                    .buttonStyle(.plain)
-                } else if let word = statusWord {
-                    Text(word)
-                        .font(ui(10.5))
-                        .foregroundStyle(tab.status == .needsInput ? Color.ink : Color.inkFaint)
-                }
+                .buttonStyle(.plain)
+            } else if let word = statusWord {
+                Text(word)
+                    .font(ui(9))
+                    .foregroundStyle(tab.status == .needsInput ? signalOrange : Color.secondary)
             }
         }
-        .padding(.horizontal, 10)
-        .frame(height: 24)
-        .background(active ? Color.ink : Color.clear)
+        .padding(.horizontal, 10).padding(.vertical, 4)
+        .background(active ? Color.primary.opacity(0.16) : Color.clear)
+        .overlay(alignment: .leading) {
+            if active { Rectangle().fill(accent).frame(width: 3) }
+        }
         .contentShape(Rectangle())
         .onTapGesture {
             // The second click of a double-click renames; the first already activated, which is harmless.
@@ -1304,6 +1186,13 @@ struct TabRow: View {
         }
         .onHover { hovering = $0 }
         .help(tab.displayTitle)
+    }
+
+    /// "name | context", one Text so the tail truncates the context and never the name.
+    private var label: Text {
+        guard let c = tab.context else { return Text(tab.title) }
+        return Text(tab.title) + Text(" | " + c).font(ui(11))
+            .foregroundColor(active ? Color.secondary : Color.secondary.opacity(0.6))
     }
 
     private var isPulsing: Bool { tab.working && !tab.attention }
@@ -1329,20 +1218,20 @@ struct ContextPanel: View {
         return VStack(alignment: .leading, spacing: 6) {
             Text(scope == "global" ? "loaded into every session"
                  : "loaded by this tab" + (result.cwd.map { " — " + short($0) } ?? ""))
-                .font(ui(11)).foregroundStyle(Color.ink)
+                .font(ui(10, bold: true))
             if result.files.isEmpty {
                 Text(scope == "global" ? "no global context files"
                      : (cwd != nil ? "no project context files" : "no shell running in this tab"))
-                    .font(ui(10)).foregroundStyle(Color.inkSoft)
+                    .font(ui(10)).foregroundStyle(.secondary)
             }
             ForEach(result.files) { f in
                 Button(action: { NSWorkspace.shared.open(URL(fileURLWithPath: f.path)) }) {
                     HStack(spacing: 8) {
-                        Text((f.path as NSString).lastPathComponent).font(ui(10)).foregroundStyle(Color.ink)
-                        Text(short((f.path as NSString).deletingLastPathComponent)).font(ui(9)).foregroundStyle(Color.inkFaint).lineLimit(1)
+                        Text((f.path as NSString).lastPathComponent).font(ui(10, bold: true))
+                        Text(short((f.path as NSString).deletingLastPathComponent)).font(ui(9)).foregroundStyle(.secondary).lineLimit(1)
                         Spacer()
                         Text(f.size < 1024 ? "\(f.size)b" : String(format: "%.1fk", Double(f.size) / 1024))
-                            .font(ui(9)).foregroundStyle(Color.inkSoft)
+                            .font(ui(9)).foregroundStyle(.tertiary)
                     }
                     .contentShape(Rectangle())
                 }

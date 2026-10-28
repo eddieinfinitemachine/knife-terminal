@@ -16,6 +16,7 @@ struct BoardCardData: Identifiable {
 
 struct BoardView: View {
     @ObservedObject var controller: KnifeWindowController
+    @ObservedObject var theme = AppModel.shared.theme
     @State private var cards: [BoardCardData] = []
     @State private var refreshing = false
     private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
@@ -24,8 +25,8 @@ struct BoardView: View {
         Group {
             if cards.isEmpty {
                 VStack(spacing: 6) {
-                    Text("no live agent sessions").font(ui(12)).foregroundStyle(Color.inkSoft)
-                    Text("open a project from the sidebar").font(ui(10)).foregroundStyle(Color.inkFaint)
+                    Text("no live agent sessions").font(ui(12)).foregroundStyle(.secondary)
+                    Text("open a project from the sidebar").font(ui(10)).foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -44,7 +45,7 @@ struct BoardView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.paper)
+        .background(Color(nsColor: theme.nsColor(theme.current.background)))
         .onAppear(perform: refresh)
         .onReceive(tick) { _ in refresh() }
     }
@@ -100,6 +101,7 @@ struct SessionCard: View {
     let messages: [ChatMessage]
     let agent: String
     let open: () -> Void
+    @ObservedObject var theme = AppModel.shared.theme
     @State private var draft = ""
     @State private var pulse = false
 
@@ -119,7 +121,7 @@ struct SessionCard: View {
         .background(Color.primary.opacity(0.05))
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10)
-            .stroke(tab.status == .needsInput ? Color.ink : Color.rule, lineWidth: 1))
+            .stroke(tab.status == .needsInput ? theme.attentionColor : Color.primary.opacity(0.12), lineWidth: 1))
     }
 
     private var isPulsing: Bool { tab.working && !tab.attention }
@@ -127,19 +129,19 @@ struct SessionCard: View {
     private var header: some View {
         HStack(spacing: 6) {
             Circle()
-                .fill(tab.attention || tab.working ? Color.live : .clear)
+                .fill(tab.attention ? theme.attentionColor : (tab.working ? theme.accentColor : .clear))
                 .frame(width: 6, height: 6)
                 .opacity(isPulsing && pulse ? 0.25 : 1.0)
                 .animation(isPulsing ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : .default, value: pulse)
                 .onAppear { pulse = isPulsing }
                 .onChange(of: isPulsing) { _, now in pulse = now }
             Text(tab.emoji).font(.system(size: 12))
-            (Text(tab.title) + Text(tab.context.map { " | " + $0 } ?? "").foregroundColor(.inkSoft))
-                .font(ui(12)).foregroundStyle(Color.ink).lineLimit(1)
+            (Text(tab.title) + Text(tab.context.map { " | " + $0 } ?? "").foregroundColor(.secondary))
+                .font(ui(12, bold: true)).lineLimit(1)
             Spacer(minLength: 0)
             Text(statusWord)
                 .font(ui(10))
-                .foregroundStyle(tab.status == .needsInput ? Color.ink : Color.inkSoft)
+                .foregroundStyle(tab.status == .needsInput ? theme.attentionColor : Color.secondary)
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: open)
@@ -162,7 +164,7 @@ struct SessionCard: View {
     @ViewBuilder
     private var body_: some View {
         if messages.isEmpty {
-            Text("no transcript yet").font(ui(10)).foregroundStyle(Color.inkFaint)
+            Text("no transcript yet").font(ui(10)).foregroundStyle(.tertiary)
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(messages) { m in
@@ -172,7 +174,7 @@ struct SessionCard: View {
                             Spacer(minLength: 24)
                             Text(markdown(m.text)).font(ui(11))
                                 .padding(.horizontal, 8).padding(.vertical, 5)
-                                .background(RoundedRectangle(cornerRadius: 8).fill(Color.paper3))
+                                .background(RoundedRectangle(cornerRadius: 8).fill(theme.accentColor.opacity(0.18)))
                         }
                     case .assistant:
                         Text(markdown(m.text)).font(ui(11))
@@ -201,7 +203,7 @@ struct SessionCard: View {
             Button("send", action: send)
                 .buttonStyle(.plain)
                 .font(ui(10))
-                .foregroundStyle(draft.isEmpty ? Color.inkFaint : Color.ink)
+                .foregroundStyle(draft.isEmpty ? Color.secondary : theme.accentColor)
                 .disabled(draft.isEmpty)
         }
     }
