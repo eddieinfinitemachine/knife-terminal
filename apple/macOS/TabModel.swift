@@ -17,32 +17,6 @@ enum TabStatus {
     case idle, working, ready, needsInput
 }
 
-/// How the sidebar files a tab.
-///   needs input / working / ready — straight from the hooks
-///   active  — anything touched in the last 24 hours (hook event, typing, opening it)
-///   dormant — nothing for a day or more, or a shell nobody has used
-/// Time, not process scanning, decides active vs dormant: it's stable (a row doesn't
-/// flicker while a scan catches up) and it's what "worked on" means.
-enum SidebarGroup: String, CaseIterable {
-    case needsInput = "needs input"
-    case working
-    case ready
-    case active
-    case dormant
-
-    static let activeWindow: TimeInterval = 24 * 60 * 60
-
-    static func of(_ status: TabStatus, lastActivity: Date?, now: Date = Date()) -> SidebarGroup {
-        switch status {
-        case .needsInput: .needsInput
-        case .working: .working
-        case .ready: .ready
-        case .idle:
-            if let t = lastActivity, now.timeIntervalSince(t) < activeWindow { .active } else { .dormant }
-        }
-    }
-}
-
 @MainActor
 final class TabModel: NSObject, ObservableObject, Identifiable {
     let id: Int
@@ -60,16 +34,28 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
     var displayTitle: String { context.map { "\(title) | \($0)" } ?? title }
     @Published var working = false
     @Published var attention = false
-    @Published var status: TabStatus = .idle { didSet { refreshGroup() } }
-    /// Last hook event, keystroke, or open. Deliberately not @Published: it moves on
-    /// every keystroke, and only a change of `group` should redraw the sidebar.
-    var lastActivity: Date? { didSet { refreshGroup() } }
-    @Published private(set) var group: SidebarGroup = .dormant
+    @Published var status: TabStatus = .idle
+    /// Last hook event, keystroke, or open; orders the sidebar's groups. Deliberately not
+    /// @Published: it moves on every keystroke, which mustn't redraw the sidebar.
+    var lastActivity: Date?
+    /// The sidebar group: the repo (or folder) the shell is in. Worked out when the cwd changes —
+    /// at open, on an OSC 7, and on the app's 15 s timer — never per render.
+    @Published private(set) var repoGroup = TabGroupID.shell
+    private var repoGroupCwd: String??   // the cwd repoGroup was worked out for; nil = not yet
 
-    /// Also called on a timer, so a tab slides to dormant once its day is up.
-    func refreshGroup(now: Date = Date()) {
-        let g = SidebarGroup.of(status, lastActivity: lastActivity, now: now)
-        if g != group { group = g }
+    func refreshRepoGroup() {
+        let cwd = currentCwd ?? opts.cwd
+        guard repoGroupCwd != .some(cwd) else { return }
+        repoGroupCwd = .some(cwd)
+        let g = TabGroupID.of(cwd: cwd)
+        if g != repoGroup { repoGroup = g }
+    }
+
+    var groupMember: TabGroupMember {
+        TabGroupMember(id: id, group: repoGroup,
+                       urgency: .of(attention: attention, needsInput: status == .needsInput,
+                                    working: working || status == .working),
+                       lastActivity: lastActivity)
     }
     var limited = false        // the turn ended on a usage limit (StopFailure rate_limit)
     var sessionId: String?     // claude's session, from its hooks — restore resumes exactly this one
@@ -191,7 +177,6 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         self.view = KnifeTermView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         super.init()
         lastActivity = opts.lastActivity
-        refreshGroup() // own-init assignments don't run didSet
         view.processDelegate = self
         AppModel.shared.theme.style(terminal: view)
 
@@ -204,6 +189,7 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         if !FileManager.default.fileExists(atPath: cwd) { cwd = NSHomeDirectory() }
         if let cmd = opts.cmd, TrustKeeper.runsClaude(cmd) { TrustKeeper.shared.settle(cwd) } // answer the trust prompt before it appears
         view.startProcess(executable: shell, args: ["-l"], environment: envList, execName: nil, currentDirectory: cwd)
+        refreshRepoGroup() // before the first render, so a new tab lands in its group at once
 
         if let cmd = opts.cmd {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
@@ -307,7 +293,10 @@ extension TabModel: LocalProcessTerminalViewDelegate {
 
     nonisolated func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
         DispatchQueue.main.async { [weak self] in
-            if let directory, let url = URL(string: directory), url.isFileURL { self?.lastReportedCwd = url.path }
+            if let directory, let url = URL(string: directory), url.isFileURL {
+                self?.lastReportedCwd = url.path
+                self?.refreshRepoGroup()
+            }
         }
     }
 

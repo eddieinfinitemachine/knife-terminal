@@ -207,3 +207,16 @@ Four agents in parallel worktrees off 30150a2 (~/Code/.worktrees/knife-zach-*), 
 - [x] Project row + its chats are one ForEach unit (drag carries them); chats aren't drag sources and a drop on them only ends the drag
 - [x] Not in ⌘K search results or "elsewhere" rows; `make mac` + ExpandedProjects tests 13/13
 - [ ] Hands-on QA after Eddie relaunches: disclosure click doesn't open a tab; drag a project with chats open, drop on its own chats; rows don't shift while hovering
+
+## Sidebar tabs grouped by repo (2026-10-28)
+
+Replaces the status groups (needs input / working / ready / active / dormant) in the tab list. Same header and row styling.
+
+- [x] Group = the tab's repo (`Repos.key`, so clones and worktrees share one), else its folder ("~" for home), else "shell". Worked out per tab when its cwd changes (at open, OSC 7, the 15 s timer, hover exit), never per render (`TabModel.repoGroup`)
+- [x] Group order: any tab needing input, then any working, then the rest; most recent `lastActivity` first within each. Manual order inside a group; drag stays inside its group
+- [x] Header = repo name + dimmed count; click folds (`knife.foldedTabGroups`, one key per line). Folded: "▸ n", plus the needs-input dot + word, else the working dot
+- [x] Row label drops the name when it matches the header (context alone); renamed tabs keep "name | context"
+- [x] Groups stored on the window controller (`tabSections`), so ⌘1–9 / ⌘⇧[ ] / close-lands-on follow what's drawn, folded groups included. Freeze (membership + group order) while the pointer is on the tab list; released on hover exit and resign-key
+- [x] `SidebarGroup` removed (sidebar was its only user; iOS has its own)
+- [x] Pure logic in TabGroups.swift; tests 43/43 (scratchpad repo-groups-tests); `make mac` BUILD SUCCEEDED
+- [ ] Hands-on QA after Eddie relaunches (not driven by hand): click rows while statuses change; drag within a group and onto another group's row; fold/unfold, folded header lights up on needs input; cd into another repo in a plain shell; ⌘1–9 vs what's drawn; a renamed tab's label

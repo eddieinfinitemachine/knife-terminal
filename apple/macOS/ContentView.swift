@@ -136,8 +136,7 @@ struct SidebarView: View {
     @State private var renamingTab: TabModel?
     @State private var tabNameText = ""
     @State private var tabContextText = ""
-    /// tab id → the group it was in when the pointer arrived over the tab list.
-    @State private var frozen: [Int: SidebarGroup]? = nil
+    @AppStorage("knife.foldedTabGroups") private var foldedTabGroupsRaw = ""   // TabGroupID keys, one per line
     @State private var activeRepo: RepoKey?   // the active tab's, for its prompt section
     @State private var pointerInside = false
     @FocusState private var searchFocused: Bool
@@ -148,29 +147,31 @@ struct SidebarView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    // Tabs grouped (needs input first); manual order kept within a group.
-                    // Headers only appear once something isn't dormant, so a window of
-                    // plain shells looks like a plain list.
+                    // Tabs grouped by repo (see TabGroups): groups with a tab needing input
+                    // first, then working, then the rest, most recent first; manual order
+                    // kept within a group. A header click folds its group.
                     VStack(alignment: .leading, spacing: 1) {
-                        let grouped = SidebarGroup.allCases.map { g in
-                            (g, controller.tabs.filter { shownGroup($0) == g })
-                        }
-                        let showHeaders = grouped.contains { $0.0 != .dormant && !$0.1.isEmpty }
-                        ForEach(grouped, id: \.0) { group, tabs in
-                            if !tabs.isEmpty {
-                                if showHeaders { tabGroupHeader(group, count: tabs.count) }
-                                ForEach(tabs) { tab in tabRow(tab) }
+                        let byId = Dictionary(controller.tabs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                        let folded = TabGroups.folded(foldedTabGroupsRaw)
+                        ForEach(controller.tabSections, id: \.group.key) { section in
+                            let shut = folded.contains(section.group.key)
+                            tabGroupHeader(section, folded: shut)
+                            if !shut {
+                                ForEach(section.ids.compactMap { byId[$0] }) { tab in
+                                    tabRow(tab, groupName: section.group.name)
+                                }
                             }
                         }
                     }
-                    // While the pointer is over the tabs, nothing changes group: rows never
-                    // move under a click, and a press isn't turned into a drag by a row
-                    // sliding away. Dots and status words keep updating live.
+                    // While the pointer is over the tabs, no tab changes group and no group
+                    // moves: rows never move under a click, and a press isn't turned into a
+                    // drag by a row sliding away. Dots and status words keep updating live.
                     .onHover { inside in
                         if inside {
-                            frozen = Dictionary(controller.tabs.map { ($0.id, $0.group) }, uniquingKeysWith: { a, _ in a })
+                            controller.freezeTabGroups(true)
                         } else {
-                            withAnimation(.easeInOut(duration: 0.2)) { frozen = nil }
+                            for t in controller.tabs { t.refreshRepoGroup() } // a cd, while the list held still
+                            withAnimation(.easeInOut(duration: 0.2)) { controller.freezeTabGroups(false) }
                         }
                     }
                     // claude or a plain shell per the footer switch; shift-click for a plain shell once
@@ -290,7 +291,7 @@ struct SidebarView: View {
         // the tabs; don't leave the list frozen until the mouse moves again.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { n in
             guard (n.object as? NSWindow) === controller.window else { return }
-            frozen = nil
+            controller.freezeTabGroups(false)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { n in
             guard (n.object as? NSWindow) === controller.window else { return }
@@ -341,8 +342,8 @@ struct SidebarView: View {
         return list.filter { $0.name.lowercased().contains(q) || $0.path.lowercased().contains(q) }
     }
 
-    private func tabRow(_ tab: TabModel) -> some View {
-        TabRow(tab: tab, active: tab.id == controller.activeId,
+    private func tabRow(_ tab: TabModel, groupName: String) -> some View {
+        TabRow(tab: tab, active: tab.id == controller.activeId, groupName: groupName,
                activate: { controller.activate(tab.id) },
                close: { controller.closeTab(tab.id) },
                rename: { startTabRename(tab) })
@@ -359,27 +360,36 @@ struct SidebarView: View {
                 sameGroup: sameShownGroup, end: endDrag))
     }
 
-    /// The group a row is drawn in: frozen while the pointer is over the tab list,
-    /// live otherwise. Drags compare this, so they match what's on screen.
-    private func shownGroup(_ tab: TabModel) -> SidebarGroup { frozen?[tab.id] ?? tab.group }
-
+    /// Whether two tabs are drawn in the same group (frozen while the pointer is over the
+    /// tab list, live otherwise). Drags compare this, so they match what's on screen.
     private func sameShownGroup(_ a: Int, _ b: Int) -> Bool {
-        guard let ta = controller.tabs.first(where: { $0.id == a }),
-              let tb = controller.tabs.first(where: { $0.id == b }) else { return false }
-        return shownGroup(ta) == shownGroup(tb)
+        controller.tabSections.contains { $0.ids.contains(a) && $0.ids.contains(b) }
     }
 
-    private func tabGroupHeader(_ group: SidebarGroup, count: Int) -> some View {
+    /// The repo's name and how many tabs it has. Folded, it still says when a tab inside wants
+    /// you: the needs-input dot and word, else the working dot.
+    private func tabGroupHeader(_ section: TabSection, folded: Bool) -> some View {
         HStack(spacing: 4) {
-            Text(group.rawValue)
-                .foregroundStyle(group == .needsInput ? theme.attentionColor : Color.secondary)
-            Text("\(count)").foregroundStyle(.tertiary)
+            Text(section.group.name)
+                .foregroundStyle(Color.secondary)
+                .lineLimit(1).truncationMode(.tail)
+            Text(folded ? "▸ \(section.ids.count)" : "\(section.ids.count)").foregroundStyle(.tertiary)
             Spacer(minLength: 0)
+            if folded && section.urgency != .none {
+                Circle()
+                    .fill(section.urgency == .needsInput ? theme.attentionColor : theme.accentColor)
+                    .frame(width: 6, height: 6)
+                if section.urgency == .needsInput {
+                    Text("needs input").font(ui(9)).foregroundStyle(theme.attentionColor)
+                }
+            }
         }
         .font(ui(10))
         .padding(.horizontal, 10)
         .padding(.top, 8)
         .padding(.bottom, 2)
+        .contentShape(Rectangle())
+        .onTapGesture { foldedTabGroupsRaw = TabGroups.toggledFold(section.group.key, in: foldedTabGroupsRaw) }
     }
 
     private func projects(in section: ProjectSection) -> [Project] {
@@ -1271,6 +1281,8 @@ struct FootButtonStyle: ButtonStyle {
 struct TabRow: View {
     @ObservedObject var tab: TabModel
     let active: Bool
+    /// The header it's listed under, whose name the label doesn't repeat (TabGroups.label).
+    var groupName: String? = nil
     let activate: () -> Void
     let close: () -> Void
     let rename: () -> Void
@@ -1320,9 +1332,12 @@ struct TabRow: View {
     }
 
     /// "name | context", one Text so the tail truncates the context and never the name.
+    /// Under a header with the tab's own name, just the context.
     private var label: Text {
-        guard let c = tab.context else { return Text(tab.title) }
-        return Text(tab.title) + Text(" | " + c).font(ui(11))
+        let (name, context) = groupName.map { TabGroups.label(title: tab.title, context: tab.context, groupName: $0) }
+            ?? (tab.title, tab.context)
+        guard let c = context else { return Text(name) }
+        return Text(name) + Text(" | " + c).font(ui(11))
             .foregroundColor(active ? Color.secondary : Color.secondary.opacity(0.6))
     }
 

@@ -60,7 +60,7 @@ final class AppModel: ObservableObject {
         saveTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
             Task { @MainActor in
                 AppModel.shared.saveSession()
-                for wc in AppModel.shared.windows { for t in wc.tabs { t.refreshGroup() } } // the 24h boundary
+                for wc in AppModel.shared.windows { wc.refreshTabGroups() } // a cd, and groups reordered by recency
                 AppModel.shared.checkSocket()
             }
         }

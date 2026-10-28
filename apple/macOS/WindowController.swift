@@ -4,23 +4,50 @@ import Combine
 
 @MainActor
 final class KnifeWindowController: NSWindowController, NSWindowDelegate, ObservableObject {
-    @Published var tabs: [TabModel] = []
+    @Published var tabs: [TabModel] = [] { didSet { regroup() } }
     @Published var activeId: Int?
     @Published var showBoard = false
     var chatPanes = 0 // ChatPanes up (not their terminal fallback): a count, since tab switches overlap appear/disappear
     var chatShowing: Bool { chatPanes > 0 } // ⌘F/⌘G go to the chat's find bar
     /// The untouched shell a fresh window opens with; replaced by the first real tab.
     var defaultTabId: Int?
-    /// The sidebar groups tabs; a tab changing group has to re-render the list
-    /// itself, not just that row.
+    /// The sidebar groups tabs by repo and ranks the groups by status; a tab changing
+    /// either has to re-render the list itself, not just that row.
     private var statusWatch: [Int: AnyCancellable] = [:]
+    /// The sidebar's tab groups exactly as drawn (TabGroups.sections). Stored, not computed:
+    /// group order depends on lastActivity, which moves on every keystroke without telling
+    /// anyone, so a computed order could differ from the one on screen. regroup() is the
+    /// only writer: on a tab added, closed or moved, a tab's repo or status changing, the
+    /// freeze, and the app's 15 s timer.
+    @Published private(set) var tabSections: [TabSection] = []
+    /// Set while the pointer is over the tab list (see TabGroupFreeze).
+    private var tabFreeze: TabGroupFreeze?
 
     var activeTab: TabModel? { tabs.first { $0.id == activeId } }
 
-    /// Tabs in the order the sidebar draws them: by group, manual order within a
-    /// group. ⌘1–9, ⌘⇧[ ] and the tab ⌘W lands on follow this, not `tabs` itself.
+    /// Tabs in the order the sidebar draws them, folded groups included. ⌘1–9, ⌘⇧[ ]
+    /// and the tab ⌘W lands on follow this, not `tabs` itself.
     var sidebarOrder: [TabModel] {
-        SidebarGroup.allCases.flatMap { g in tabs.filter { $0.group == g } }
+        let byId = Dictionary(tabs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        return tabSections.flatMap(\.ids).compactMap { byId[$0] }
+    }
+
+    func regroup() {
+        let next = TabGroups.sections(tabs.map(\.groupMember), frozen: tabFreeze)
+        if next != tabSections { tabSections = next }
+    }
+
+    /// The sidebar's hover: freeze what's on screen, or let it catch up.
+    func freezeTabGroups(_ on: Bool) {
+        tabFreeze = on ? TabGroupFreeze(tabSections) : nil
+        regroup()
+    }
+
+    /// The app's 15 s timer: pick up a cd the shell didn't announce, and re-rank groups whose
+    /// recency typing has changed.
+    func refreshTabGroups() {
+        for t in tabs { t.refreshRepoGroup() }
+        regroup()
     }
 
     convenience init(bounds: NSRect?) {
@@ -45,9 +72,14 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
         let tab = TabModel(id: AppModel.shared.takeTabId(), opts: opts)
         tabs.append(tab)
         statusWatch[tab.id] = Publishers.Merge(
-            tab.$group.dropFirst().removeDuplicates().map { _ in () },
+            Publishers.Merge3(
+                tab.$repoGroup.dropFirst().removeDuplicates().map { _ in () },
+                tab.$attention.dropFirst().removeDuplicates().map { _ in () },
+                tab.$working.dropFirst().removeDuplicates().map { _ in () }),
             tab.$status.dropFirst().removeDuplicates().map { _ in () })
-            .sink { [weak self] in self?.objectWillChange.send() }
+            // @Published fires in willSet, before the tab holds the new value: regroup after it lands
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.regroup(); self?.objectWillChange.send() }
         AppModel.shared.tabOpened(tab, in: self)
         if activateIt { activate(tab.id) }
         return tab
