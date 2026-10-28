@@ -278,7 +278,12 @@ struct SidebarView: View {
             return true
         }
         .onAppear { rebuild(); refreshRepo() }
-        .onChange(of: controller.activeId) { refreshRepo() }
+        .onChange(of: controller.activeId) { old, new in
+            refreshRepo()
+            // ⌘1–9, a notification, the board…: the tab asked for shows, even in a folded group
+            let raw = TabGroups.revealing(active: new, previous: old, in: controller.tabSections, folded: foldedTabGroupsRaw)
+            if raw != foldedTabGroupsRaw { foldedTabGroupsRaw = raw }
+        }
         .alert(naming?.title ?? "", isPresented: Binding(
             get: { naming != nil }, set: { if !$0 { naming = nil } })) {
             TextField("name", text: $folderNameText)

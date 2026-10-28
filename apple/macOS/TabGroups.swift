@@ -114,6 +114,17 @@ enum TabGroups {
         Set(raw.split(separator: "\n").map(String.init))
     }
 
+    /// The folded set once the active tab has changed from `old` to `new`: the group now holding
+    /// the active tab opens, so its row shows highlighted. Only on a change — a group folded
+    /// over the active tab stays folded — and only that group; nothing else moves.
+    static func revealing(active new: Int?, previous old: Int?, in sections: [TabSection], folded raw: String) -> String {
+        guard let new, new != old,
+              let key = sections.first(where: { $0.ids.contains(new) })?.group.key else { return raw }
+        var set = folded(raw)
+        guard set.remove(key) != nil else { return raw }
+        return set.sorted().joined(separator: "\n")
+    }
+
     static func toggledFold(_ key: String, in raw: String) -> String {
         var set = folded(raw)
         if !set.insert(key).inserted { set.remove(key) }
