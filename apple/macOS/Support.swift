@@ -214,6 +214,9 @@ struct Project: Identifiable {
 }
 
 enum ProjectSection: String, Codable, CaseIterable {
+    /// Flagged for review: above ★, and ahead of it — a flagged star shows here. Never an
+    /// override and never a folder's section; a project is here only while `flagged` is set.
+    case review
     case starred, active, dormant, archived
 }
 
@@ -221,6 +224,9 @@ struct ProjectMeta: Codable, Equatable {
     var starred = false
     var override: ProjectSection? = nil
     var name: String? = nil   // custom display name; folder on disk is untouched
+    /// When it was flagged for review; nil = not flagged. Its folder, star and place in its own
+    /// section are left as they are, so clearing the flag puts it back where it was.
+    var flagged: Date? = nil
 }
 
 enum Projects {
@@ -230,6 +236,39 @@ enum Projects {
         var order: [String: [String]] = [:]
         var tree: FolderTree? = nil   // folders made in the sidebar (SidebarFolders.swift)
         var roots: [String]? = nil    // folders added from disk, scanned like codeRoots
+
+        /// "flag for review" / "done reviewing": only the flag changes, so the project comes back
+        /// to its folder, its star and its spot in its section.
+        mutating func setFlag(_ path: String, _ on: Bool, now: Date = Date()) {
+            var saved = byPath[path] ?? ProjectMeta()
+            saved.flagged = on ? (saved.flagged ?? now) : nil
+            byPath[path] = saved
+        }
+
+        /// A project let go in `target` (a drag, or "move to …"). Into review it's flagged and
+        /// nothing else changes. Anywhere else it's unflagged and takes that section, filed in
+        /// `folder` (nil = loose); `snapshot` is the section's order as drawn, if the drop has one.
+        mutating func drop(_ p: Project, into target: ProjectSection, folder: String?, order snapshot: [String]?) {
+            guard target != .review else { return setFlag(p.path, true) }
+            var saved = byPath[p.path] ?? ProjectMeta()
+            saved.flagged = nil
+            if target == .starred {
+                saved.starred = true
+            } else {
+                saved.starred = false
+                saved.override = target == Projects.autoSection(p) ? nil : target
+            }
+            byPath[p.path] = saved
+            var t = tree ?? FolderTree()
+            t.file(p.path, into: folder)
+            tree = t
+            for section in ProjectSection.allCases {
+                let key = section.rawValue
+                order[key]?.removeAll { $0 == p.path }
+                if order[key]?.isEmpty == true { order.removeValue(forKey: key) }
+            }
+            if let snapshot { order[target.rawValue] = snapshot }
+        }
     }
 
     static func encode(_ p: String) -> String {
@@ -248,8 +287,16 @@ enum Projects {
     }
 
     static func saveMeta(_ meta: SidebarMeta) {
+        let cleaned = cleaned(meta, projects: list(extraRoots: meta.roots ?? []))
+        guard let data = try? JSONEncoder().encode(cleaned) else { return }
+        UserDefaults.standard.set(data, forKey: metaKey)
+    }
+
+    /// What saveMeta keeps: entries for listed projects only, and each section's order holding
+    /// just the projects whose home it is. A flagged project keeps its spot in its home section's
+    /// order (review has none: it's by flag time), so clearing the flag puts it back there.
+    static func cleaned(_ meta: SidebarMeta, projects: [Project]) -> SidebarMeta {
         var cleaned = meta
-        let projects = list(extraRoots: meta.roots ?? [])
         let currentPaths = Set(projects.map(\.path))
         cleaned.byPath = cleaned.byPath.filter {
             currentPaths.contains($0.key) && $0.value != ProjectMeta()
@@ -257,18 +304,16 @@ enum Projects {
         cleaned.tree?.prune(keeping: currentPaths)
         if cleaned.tree?.isEmpty == true { cleaned.tree = nil }
         if cleaned.roots?.isEmpty == true { cleaned.roots = nil }
-        let members = Dictionary(uniqueKeysWithValues: sectioned(projects, meta: cleaned).map {
-            ($0.0.rawValue, Set($0.1.map(\.path)))
-        })
+        let home = Dictionary(projects.map { ($0.path, section(of: $0, meta: cleaned, flag: false)) },
+                              uniquingKeysWith: { a, _ in a })
         var order: [String: [String]] = [:]
-        for section in ProjectSection.allCases {
+        for section in ProjectSection.allCases where section != .review {
             let key = section.rawValue
-            let live = (cleaned.order[key] ?? []).filter { members[key]?.contains($0) == true }
+            let live = (cleaned.order[key] ?? []).filter { home[$0] == section }
             if !live.isEmpty { order[key] = live }
         }
         cleaned.order = order
-        guard let data = try? JSONEncoder().encode(cleaned) else { return }
-        UserDefaults.standard.set(data, forKey: metaKey)
+        return cleaned
     }
 
     /// Remember that a project was just opened from Knife, so it sorts to the
@@ -300,15 +345,31 @@ enum Projects {
         return p.t >= now - 24 * 60 * 60 ? .active : .dormant  // worked on in the last day
     }
 
+    /// The section a project shows in. `flag: false` gives its home — where it is when not
+    /// flagged, and where clearing the flag returns it.
+    static func section(of p: Project, meta: SidebarMeta, flag: Bool = true) -> ProjectSection {
+        let saved = meta.byPath[p.path] ?? ProjectMeta()
+        if flag && saved.flagged != nil { return .review }
+        if saved.starred { return .starred }
+        if let o = saved.override, o != .review { return o }
+        return autoSection(p)
+    }
+
+    /// Review's order: newest flagged first. One not flagged yet (being dragged in) counts as
+    /// flagged `now`, so it sits on top, where the drop will put it.
+    static func reviewOrder(_ projects: [Project], meta: SidebarMeta, now: Date = Date()) -> [Project] {
+        func at(_ p: Project) -> Date { meta.byPath[p.path]?.flagged ?? now }
+        return projects.sorted { at($0) != at($1) ? at($0) > at($1) : $0.t > $1.t }
+    }
+
     static func sectioned(_ projects: [Project], meta: SidebarMeta) -> [(ProjectSection, [Project])] {
         var grouped = Dictionary(uniqueKeysWithValues: ProjectSection.allCases.map { ($0, [Project]()) })
         for p in projects {
-            let saved = meta.byPath[p.path] ?? ProjectMeta()
-            let section = saved.starred ? ProjectSection.starred : (saved.override ?? autoSection(p))
-            grouped[section, default: []].append(p)
+            grouped[section(of: p, meta: meta), default: []].append(p)
         }
         return ProjectSection.allCases.map { section in
             let members = grouped[section, default: []]
+            if section == .review { return (section, reviewOrder(members, meta: meta)) }
             let byPath = Dictionary(uniqueKeysWithValues: members.map { ($0.path, $0) })
             var seen = Set<String>()
             let ordered = (meta.order[section.rawValue] ?? []).compactMap { path -> Project? in
