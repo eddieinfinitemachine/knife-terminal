@@ -14,12 +14,14 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
     /// The sidebar groups tabs by repo and ranks the groups by status; a tab changing
     /// either has to re-render the list itself, not just that row.
     private var statusWatch: [Int: AnyCancellable] = [:]
-    /// The sidebar's tab groups exactly as drawn (TabGroups.sections). Stored, not computed:
+    /// The sidebar's tab list exactly as drawn (TabGroups.tiers). Stored, not computed:
     /// group order depends on lastActivity, which moves on every keystroke without telling
     /// anyone, so a computed order could differ from the one on screen. regroup() is the
     /// only writer: on a tab added, closed or moved, a tab's repo or status changing, the
     /// freeze, and the app's 15 s timer.
-    @Published private(set) var tabSections: [TabSection] = []
+    @Published private(set) var tabTiers: [TabTierSection] = []
+    /// The repo groups in drawn order, active's then dormant's.
+    var tabSections: [TabSection] { tabTiers.flatMap(\.repos) }
     /// Set while the pointer is over the tab list (see TabGroupFreeze).
     private var tabFreeze: TabGroupFreeze?
 
@@ -33,18 +35,18 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
     }
 
     func regroup() {
-        let next = TabGroups.sections(tabs.map(\.groupMember), frozen: tabFreeze)
-        if next != tabSections { tabSections = next }
+        let next = TabGroups.tiers(tabs.map(\.groupMember), frozen: tabFreeze)
+        if next != tabTiers { tabTiers = next }
     }
 
     /// The sidebar's hover: freeze what's on screen, or let it catch up.
     func freezeTabGroups(_ on: Bool) {
-        tabFreeze = on ? TabGroupFreeze(tabSections) : nil
+        tabFreeze = on ? TabGroupFreeze(tabTiers) : nil
         regroup()
     }
 
-    /// The app's 15 s timer: pick up a cd the shell didn't announce, and re-rank groups whose
-    /// recency typing has changed.
+    /// The app's 15 s timer: pick up a cd the shell didn't announce, move tabs whose day is up to
+    /// dormant (or typed into back to active), and re-rank groups whose recency has changed.
     func refreshTabGroups() {
         for t in tabs { t.refreshRepoGroup() }
         regroup()

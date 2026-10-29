@@ -51,11 +51,12 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         if g != repoGroup { repoGroup = g }
     }
 
+    /// Read on every regroup; the app's 15 s timer regroups, so a tab slides to dormant once its day is up.
     var groupMember: TabGroupMember {
-        TabGroupMember(id: id, group: repoGroup,
-                       urgency: .of(attention: attention, needsInput: status == .needsInput,
-                                    working: working || status == .working),
-                       lastActivity: lastActivity)
+        let urgency = TabUrgency.of(attention: attention, needsInput: status == .needsInput,
+                                    working: working || status == .working)
+        return TabGroupMember(id: id, group: repoGroup, urgency: urgency, lastActivity: lastActivity,
+                              tier: .of(urgency: urgency, ready: status == .ready, lastActivity: lastActivity))
     }
     var limited = false        // the turn ended on a usage limit (StopFailure rate_limit)
     var sessionId: String?     // claude's session, from its hooks — restore resumes exactly this one

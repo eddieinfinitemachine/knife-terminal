@@ -139,8 +139,8 @@ struct SidebarView: View {
     @State private var renamingTab: TabModel?
     @State private var tabNameText = ""
     @State private var tabContextText = ""
-    @AppStorage("knife.foldedTabGroups") private var foldedTabGroupsRaw = ""   // TabGroupID keys, one per line
-    @State private var hoverTabGroup: String?   // the repo header under the pointer, for its "+"
+    @AppStorage("knife.foldedTabGroups") private var foldedTabGroupsRaw = ""   // TabSection ids and TabTier fold keys, one per line
+    @State private var hoverTabGroup: String?   // the repo header (TabSection.id) under the pointer, for its "+"
     @State private var activeRepo: RepoKey?   // the active tab's, for its prompt section
     @State private var pointerInside = false
     @FocusState private var searchFocused: Bool
@@ -151,24 +151,34 @@ struct SidebarView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    // Tabs grouped by repo (see TabGroups): groups with a tab needing input
-                    // first, then working, then the rest, most recent first; manual order
-                    // kept within a group. A header click folds its group.
+                    // Tabs as active / dormant, repo groups under each (see TabGroups): under
+                    // active, groups with a tab needing input first, then working, then the
+                    // rest, most recent first; manual order kept within a group. Header clicks
+                    // fold. While nothing is active the tier header isn't drawn, so a window of
+                    // plain shells reads as a plain list of repo groups.
                     VStack(alignment: .leading, spacing: 1) {
                         let byId = Dictionary(controller.tabs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
                         let folded = TabGroups.folded(foldedTabGroupsRaw)
-                        ForEach(controller.tabSections, id: \.group.key) { section in
-                            let shut = folded.contains(section.group.key)
-                            tabGroupHeader(section, folded: shut)
-                            if !shut {
-                                ForEach(section.ids.compactMap { byId[$0] }) { tab in
-                                    tabRow(tab, groupName: section.group.name)
+                        let tierHeaders = TabGroups.showsTierHeaders(controller.tabTiers)
+                        let indent = tierHeaders ? Self.indent(1) : 0
+                        ForEach(controller.tabTiers, id: \.tier) { tier in
+                            let tierShut = tierHeaders && folded.contains(tier.tier.foldKey)
+                            if tierHeaders { tabTierHeader(tier, folded: tierShut) }
+                            if !tierShut {
+                                ForEach(tier.repos, id: \.id) { section in
+                                    let shut = folded.contains(section.id)
+                                    tabGroupHeader(section, folded: shut, indent: indent)
+                                    if !shut {
+                                        ForEach(section.ids.compactMap { byId[$0] }) { tab in
+                                            tabRow(tab, groupName: section.group.name, indent: indent)
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    // While the pointer is over the tabs, no tab changes group and no group
-                    // moves: rows never move under a click, and a press isn't turned into a
+                    // While the pointer is over the tabs, no tab changes tier or group and no
+                    // group moves: rows never move under a click, and a press isn't turned into a
                     // drag by a row sliding away. Dots and status words keep updating live.
                     .onHover { inside in
                         if inside {
@@ -285,7 +295,7 @@ struct SidebarView: View {
         .onChange(of: controller.activeId) { old, new in
             refreshRepo()
             // ⌘1–9, a notification, the board…: the tab asked for shows, even in a folded group
-            let raw = TabGroups.revealing(active: new, previous: old, in: controller.tabSections, folded: foldedTabGroupsRaw)
+            let raw = TabGroups.revealing(active: new, previous: old, in: controller.tabTiers, folded: foldedTabGroupsRaw)
             if raw != foldedTabGroupsRaw { foldedTabGroupsRaw = raw }
         }
         .alert(naming?.title ?? "", isPresented: Binding(
@@ -351,8 +361,8 @@ struct SidebarView: View {
         return list.filter { $0.name.lowercased().contains(q) || $0.path.lowercased().contains(q) }
     }
 
-    private func tabRow(_ tab: TabModel, groupName: String) -> some View {
-        TabRow(tab: tab, active: tab.id == controller.activeId, groupName: groupName,
+    private func tabRow(_ tab: TabModel, groupName: String, indent: CGFloat) -> some View {
+        TabRow(tab: tab, active: tab.id == controller.activeId, groupName: groupName, indent: indent,
                activate: { controller.activate(tab.id) },
                close: { controller.closeTab(tab.id) },
                rename: { startTabRename(tab) })
@@ -369,31 +379,54 @@ struct SidebarView: View {
                 sameGroup: sameShownGroup, end: endDrag))
     }
 
-    /// Whether two tabs are drawn in the same group (frozen while the pointer is over the
-    /// tab list, live otherwise). Drags compare this, so they match what's on screen.
+    /// Whether two tabs are drawn in the same repo group under the same tier (frozen while the
+    /// pointer is over the tab list, live otherwise). Drags compare this, so they match what's on screen.
     private func sameShownGroup(_ a: Int, _ b: Int) -> Bool {
         controller.tabSections.contains { $0.ids.contains(a) && $0.ids.contains(b) }
     }
 
-    /// The repo's name and how many tabs it has. Folded, it still says when a tab inside wants
-    /// you: the needs-input dot and word, else the working dot.
-    private func tabGroupHeader(_ section: TabSection, folded: Bool) -> some View {
+    /// "active 10" / "dormant 5", the status groups' header from before repo grouping.
+    private func tabTierHeader(_ tier: TabTierSection, folded: Bool) -> some View {
+        HStack(spacing: 4) {
+            Text(tier.tier.rawValue)
+                .foregroundStyle(Color.secondary)
+            Text(folded ? "▸ \(tier.count)" : "\(tier.count)").foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+            if folded { foldedStatus(tier.urgency) }
+        }
+        .font(ui(10))
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+        .contentShape(Rectangle())
+        .onTapGesture { foldedTabGroupsRaw = TabGroups.toggledFold(tier.tier.foldKey, in: foldedTabGroupsRaw) }
+    }
+
+    /// A folded header still says when a tab inside wants you: the needs-input dot and word,
+    /// else the working dot.
+    @ViewBuilder
+    private func foldedStatus(_ urgency: TabUrgency) -> some View {
+        if urgency != .none {
+            Circle()
+                .fill(urgency == .needsInput ? theme.attentionColor : theme.accentColor)
+                .frame(width: 6, height: 6)
+            if urgency == .needsInput {
+                Text("needs input").font(ui(9)).foregroundStyle(theme.attentionColor)
+            }
+        }
+    }
+
+    /// The repo's name and how many tabs it has, one step in under its tier's header.
+    private func tabGroupHeader(_ section: TabSection, folded: Bool, indent: CGFloat) -> some View {
         HStack(spacing: 4) {
             Text(section.group.name)
                 .foregroundStyle(Color.secondary)
                 .lineLimit(1).truncationMode(.tail)
             Text(folded ? "▸ \(section.ids.count)" : "\(section.ids.count)").foregroundStyle(.tertiary)
             Spacer(minLength: 0)
-            if folded && section.urgency != .none {
-                Circle()
-                    .fill(section.urgency == .needsInput ? theme.attentionColor : theme.accentColor)
-                    .frame(width: 6, height: 6)
-                if section.urgency == .needsInput {
-                    Text("needs input").font(ui(9)).foregroundStyle(theme.attentionColor)
-                }
-            }
+            if folded { foldedStatus(section.urgency) }
             // always laid out, shown on hover: the header never changes size under the pointer
-            let hovered = hoverTabGroup == section.group.key
+            let hovered = hoverTabGroup == section.id
             Button { newSession(in: section) } label: { Text("+").font(ui(12)).frame(height: 11) }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
                 .help("new claude session in \(section.group.name)")
@@ -401,14 +434,14 @@ struct SidebarView: View {
                 .allowsHitTesting(hovered)
         }
         .font(ui(10))
-        .padding(.horizontal, 10)
+        .padding(.leading, 10 + indent).padding(.trailing, 10)
         .padding(.top, 8)
         .padding(.bottom, 2)
         .contentShape(Rectangle())
         .onHover { inside in
-            if inside { hoverTabGroup = section.group.key } else if hoverTabGroup == section.group.key { hoverTabGroup = nil }
+            if inside { hoverTabGroup = section.id } else if hoverTabGroup == section.id { hoverTabGroup = nil }
         }
-        .onTapGesture { foldedTabGroupsRaw = TabGroups.toggledFold(section.group.key, in: foldedTabGroupsRaw) }
+        .onTapGesture { foldedTabGroupsRaw = TabGroups.toggledFold(section.id, in: foldedTabGroupsRaw) }
     }
 
     /// A group's "+": a fresh claude at the root of the repo (or in the folder, for a group that
@@ -1337,6 +1370,7 @@ struct TabRow: View {
     let active: Bool
     /// The header it's listed under, whose name the label doesn't repeat (TabGroups.label).
     var groupName: String? = nil
+    var indent: CGFloat = 0     // one step in when nested under active / dormant
     let activate: () -> Void
     let close: () -> Void
     let rename: () -> Void
@@ -1371,7 +1405,7 @@ struct TabRow: View {
                     .foregroundStyle(tab.status == .needsInput ? signalOrange : Color.secondary)
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 4)
+        .padding(.leading, 10 + indent).padding(.trailing, 10).padding(.vertical, 4)
         .background(active ? Color.primary.opacity(0.16) : Color.clear)
         .overlay(alignment: .leading) {
             if active { Rectangle().fill(accent).frame(width: 3) }
