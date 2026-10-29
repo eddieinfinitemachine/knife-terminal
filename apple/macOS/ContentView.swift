@@ -140,6 +140,7 @@ struct SidebarView: View {
     @State private var tabNameText = ""
     @State private var tabContextText = ""
     @AppStorage("knife.foldedTabGroups") private var foldedTabGroupsRaw = ""   // TabGroupID keys, one per line
+    @State private var hoverTabGroup: String?   // the repo header under the pointer, for its "+"
     @State private var activeRepo: RepoKey?   // the active tab's, for its prompt section
     @State private var pointerInside = false
     @FocusState private var searchFocused: Bool
@@ -391,13 +392,34 @@ struct SidebarView: View {
                     Text("needs input").font(ui(9)).foregroundStyle(theme.attentionColor)
                 }
             }
+            // always laid out, shown on hover: the header never changes size under the pointer
+            let hovered = hoverTabGroup == section.group.key
+            Button { newSession(in: section) } label: { Text("+").font(ui(12)).frame(height: 11) }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help("new claude session in \(section.group.name)")
+                .opacity(hovered ? 1 : 0)
+                .allowsHitTesting(hovered)
         }
         .font(ui(10))
         .padding(.horizontal, 10)
         .padding(.top, 8)
         .padding(.bottom, 2)
         .contentShape(Rectangle())
+        .onHover { inside in
+            if inside { hoverTabGroup = section.group.key } else if hoverTabGroup == section.group.key { hoverTabGroup = nil }
+        }
         .onTapGesture { foldedTabGroupsRaw = TabGroups.toggledFold(section.group.key, in: foldedTabGroupsRaw) }
+    }
+
+    /// A group's "+": a fresh claude at the root of the repo (or in the folder, for a group that
+    /// isn't one). A repo group can span clones, so it's the root of its most recently used tab's.
+    private func newSession(in section: TabSection) {
+        let recent = controller.tabs.filter { section.ids.contains($0.id) }
+            .max { ($0.lastActivity ?? .distantPast) < ($1.lastActivity ?? .distantPast) }
+        let dir = (recent?.currentCwd ?? recent?.opts.cwd).map { Repos.locate($0)?.root ?? $0 }
+        if let dir { Projects.touch(dir) }
+        controller.addTab(TabOptions(cwd: dir, cmd: "claude", title: section.group.key == "shell" ? nil : section.group.name,
+                                     restoreCmd: "claude -c", lastActivity: Date()))
     }
 
     private func projects(in section: ProjectSection) -> [Project] {
