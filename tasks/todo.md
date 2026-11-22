@@ -261,3 +261,20 @@ Measured: load 224 on 16 cores, 64 live Claude sessions under Knife (29 tabs), m
 **Review**: stopped 33 dormant sessions by hand first (67 → 35 claude processes). Old code timed on the live tabs:
 29 `pgrep`s = ~3 s on the main thread at load 224, ~1 s at load 90; replacement 1 ms with identical answers.
 Not verified live: everything in the QA line above — the running app is the Oct 29 build until relaunch.
+
+## Merge v1.4.33-eddie (CW&T 1.4.33) into knife-2 (2026-11-22)
+
+Branch `knife-2-1.4.33` (worktree `~/Code/.worktrees/knife-terminal-1.4.33`): knife-2 + the 2026-11-17 performance
+work (its own commit) + tag `v1.4.33-eddie`. The main checkout and `knife-2` were not touched.
+
+- [x] Performance work committed on its own before the merge (12 files, same diff as the main checkout's working tree)
+- [x] 14 conflicted files resolved, each side's intent kept (release features + version 1.4.33 / build 1.1.13 + SwiftTerm < 1.99; Instance routing; origin from .git/config; every perf fix)
+- [x] Upstream fixed two of the same things independently: origin parsing (kept upstream's `Manifest.originURL`, origin-only like `git remote get-url origin`) and orphaned shells on tab close (upstream's session sweep + SIGKILL after 2 s, with the perf SIGHUP + reap folded into the shared `TabModel.terminate(_:session:)`, so mini terminals get it too)
+- [x] Semantic fixes in merged code: slash-command lookup reads `Instance.claudeDir`; `restartSync()` (new, zone join/leave) is gated like `start()` (`syncAllowed`: entitlement and not Knife 2); "Run Jobs On" hidden in Knife 2 (it would rewrite the main app's ~/.knife/manifest.json); phone photo paste waits for a dormant tab's agent; `make mac-2` gets the release's optimisation flags
+- [x] Built, not installed: `KnifeMac` as Knife Terminal (com.zelig.knifeterminal, 1.4.33 / 1.1.13) and as Knife 2 (com.zelig.knifeterminal.2, KnifeInstance 2, ~/.claude-worker, no iCloud entitlement); KnifeKit `swift test` 17/17; `apple/knife-job-check.sh` ok
+- [ ] Hands-on QA of the merged app (and of the perf QA line above) after Eddie installs it; then fast-forward `knife-2`
+
+**Review**: the release untracks `build/` (and deletes the tracked `build/icon.icns`, the source of the local gold-dot
+`apple/Resources/icon.icns`, which stays skip-worktree). Merging into the main checkout would delete that file there:
+copy it aside first. Local builds still point Sparkle at CW&T's appcast (`KNIFE_FEED_URL` default); only the fork's CI
+build uses appcast-eddie.xml.

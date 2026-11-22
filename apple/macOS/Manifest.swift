@@ -18,9 +18,37 @@ enum Manifest {
         return String(raw.map { $0.isLetter || $0.isNumber ? $0 : "-" })
     }()
 
+    /// Tab ids start here so two Macs publishing to the same zone never collide
+    /// (Tab records are "tab-<id>" and Input/Seen/Close records carry the id):
+    /// a stable hash of the machine name × 10000. Ids are opaque everywhere else.
+    static let tabIdBase: Int = {
+        let h = machine.utf8.reduce(5381) { ($0 &* 33 &+ Int($1)) & 0x7fff_ffff }
+        return (h % 900 + 100) * 10_000 + 1
+    }()
+
+    static func owns(_ tabId: Int) -> Bool { (tabIdBase..<tabIdBase + 10_000).contains(tabId) }
+
     /// Other machines' lists, as last fetched from CloudKit (record name → refs).
     static var remoteLists: [String: [ProjectRef]] = [:]
     static private(set) var merged: [ProjectRef] = []
+
+    /// Every Mac publishing a manifest slice (this one included) — the run-on choices.
+    static var machines: [String] {
+        let others = remoteLists.keys.map { String($0.dropFirst("projects-".count)) }.filter { $0 != ProjectRef.whereMachine }
+        return Array(Set(others + [machine])).sorted()
+    }
+
+    static var tags: [String: String] { ProjectRef.tags([remoteLists["projects-" + ProjectRef.whereMachine] ?? []]) }
+
+    /// Set (or clear, tag nil) where a project's jobs run; lands in the shared
+    /// "projects-where" record so every Mac and the phone see it.
+    static func setRunOn(remote: String, tag: String?) {
+        var t = tags; t[remote] = tag
+        let refs = ProjectRef.tagRefs(t)
+        remoteLists["projects-" + ProjectRef.whereMachine] = refs
+        write(local: localRefs())
+        Task { try? await AppModel.shared.sync?.cloud.saveProjects(refs, machine: ProjectRef.whereMachine) }
+    }
 
     // ─── This machine's entries ───
 
@@ -42,6 +70,7 @@ enum Manifest {
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try? enc.encode(merged).write(to: URL(fileURLWithPath: path), options: .atomic)
+        try? JSONEncoder().encode(["self": [machine], "all": machines]).write(to: URL(fileURLWithPath: dir + "/machines.json"), options: .atomic)
     }
 
     /// Sidebar list: this Mac's projects, then manifest projects that only exist
@@ -62,8 +91,16 @@ enum Manifest {
         if FileManager.default.fileExists(atPath: path) { return (path, merged.first { $0.path == path }) }
         guard let ref = merged.first(where: { $0.path == path }), let remote = ref.remote else { return (nil, nil) }
         let local = merged.first { $0.remote == remote && FileManager.default.fileExists(atPath: $0.path) && self.remote(of: $0.path) == remote }?.path
-            ?? [dir + "/projects/" + cloneName(remote)].first { FileManager.default.fileExists(atPath: $0 + "/.git") }
+            // clones are named after the repo alone: only ours if it really is this remote
+            ?? [dir + "/projects/" + cloneName(remote)].first { self.remote(of: $0).map(repoKey) == repoKey(remote) }
         return (local, ref)
+    }
+
+    /// owner/repo, whatever the URL form (https, ssh, with or without .git)
+    static func repoKey(_ remote: String) -> String {
+        var r = remote.lowercased()
+        if r.hasSuffix(".git") { r.removeLast(4) }
+        return r.replacingOccurrences(of: ":", with: "/").split(separator: "/").suffix(2).joined(separator: "/")
     }
 
     static func cloneName(_ remote: String) -> String {
@@ -80,12 +117,29 @@ enum Manifest {
         guard let m = (try? FileManager.default.attributesOfItem(atPath: path + "/.git/config"))?[.modificationDate] as? Date
         else { return nil } // not a repo (or a worktree, whose .git is a file)
         if let c = remoteCache[path], c.mtime == m { return c.remote }
-        // Parse the config, never shell out: this runs inside SwiftUI view bodies (every project
-        // row's context menu), where Process.waitUntilExit spins the run loop and re-enters the
-        // SwiftUI update cycle — a segfault (crash reports 2026-11-03).
-        let text = (try? String(contentsOfFile: path + "/.git/config", encoding: .utf8)) ?? ""
-        remoteCache[path] = (m, Repos.originURL(inConfig: text))
-        return remoteCache[path]?.remote
+        // Read straight from the file, never shell out: this runs on the main thread for every
+        // sidebar project, including inside SwiftUI view bodies (every project row's context menu),
+        // where Process.waitUntilExit spins the run loop and re-enters the SwiftUI update cycle,
+        // a segfault (crash reports 2026-11-03); `git remote get-url` was also one process each.
+        // ponytail: no url.insteadOf rewriting or include files; go back to git if a repo needs them
+        let r = (try? String(contentsOfFile: path + "/.git/config", encoding: .utf8)).flatMap(originURL(inConfig:))
+        remoteCache[path] = (m, r)
+        return r
+    }
+
+    static func originURL(inConfig text: String) -> String? {
+        var inOrigin = false
+        for raw in text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                inOrigin = line.filter { !$0.isWhitespace } == "[remote\"origin\"]"
+            } else if inOrigin, let eq = line.firstIndex(of: "="),
+                      line[..<eq].trimmingCharacters(in: .whitespaces) == "url" {
+                let url = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                return url.isEmpty ? nil : url
+            }
+        }
+        return nil
     }
 
     // ─── Descriptions: README first paragraph, else a model writes one; cached by remote ───

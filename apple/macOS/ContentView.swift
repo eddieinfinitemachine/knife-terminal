@@ -16,8 +16,45 @@ func ui(_ size: CGFloat, bold: Bool = false) -> Font {
 }
 
 // Upstream's chat view and git panel are set in Space Mono.
+@MainActor
 func mono(_ size: CGFloat, bold: Bool = false) -> Font {
-    Font.custom(bold ? "Space Mono Bold" : "Space Mono", size: size)
+    let user = AppModel.shared.theme.user
+    let allowBold = bold && user.boldText
+    if let f = user.chromeFont {
+        return NSFont(name: f.regular, size: size) != nil
+            ? Font.custom(allowBold ? f.bold : f.regular, size: size)
+            : .system(size: size, weight: allowBold ? .medium : .regular)
+    }
+    return Font.custom(allowBold ? "Space Mono Bold" : "Space Mono", size: size)
+}
+
+// Secondary/tertiary labels render grey — vetoed on dark for a no-grey-on-black
+// user style, where they become the style's replacement color (or primary).
+extension ThemeManager {
+    private func hexColor(_ hex: UInt32) -> AnyShapeStyle {
+        AnyShapeStyle(Color(red: Double((hex >> 16) & 0xff) / 255,
+                            green: Double((hex >> 8) & 0xff) / 255,
+                            blue: Double(hex & 0xff) / 255))
+    }
+    private var greyLift: AnyShapeStyle {
+        user.greyReplacementHex.map(hexColor) ?? AnyShapeStyle(.primary)
+    }
+    var muted: AnyShapeStyle {
+        user.greyOnBlack || !isDark ? AnyShapeStyle(.secondary) : greyLift
+    }
+    var faint: AnyShapeStyle {
+        user.greyOnBlack || !isDark ? AnyShapeStyle(.tertiary) : greyLift
+    }
+    // Shell list: where greys are vetoed, the one loud color belongs to the
+    // ACTIVE shell (accent active over plain siblings); the house style keeps
+    // bold-primary active over grey inactive.
+    var tabActive: AnyShapeStyle {
+        guard !user.greyOnBlack, isDark, let hex = user.accentHex else { return AnyShapeStyle(.primary) }
+        return hexColor(hex)
+    }
+    var tabInactive: AnyShapeStyle {
+        user.greyOnBlack || !isDark ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary)
+    }
 }
 
 struct ContentView: View {
@@ -57,6 +94,7 @@ struct ContentView: View {
                             .id(tab.id) // fresh state per tab: echoes, opened runs, find never carry over
                     } else {
                         TerminalPane(controller: controller)
+                            .padding(.leading, 6) // keep TUI list bullets off the separator line
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -194,7 +232,7 @@ struct SidebarView: View {
                             Text("+").font(ui(12))
                             Text("new tab").font(ui(11))
                         }
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(theme.muted)
                         .padding(.horizontal, 10).padding(.vertical, 4)
                     }
                     .buttonStyle(.plain)
@@ -263,12 +301,14 @@ struct SidebarView: View {
                     ForEach(filteredElsewhere) { p in
                         Button(action: { AppModel.shared.openProject(p.path, cmd: "claude"); query = ""; searchFocused = false }) {
                             HStack(spacing: 6) {
-                                Text(Emoji.forPath(p.path)).font(.system(size: 12))
+                                if theme.user.emoticons {
+                                    Text(Emoji.forPath(p.path)).font(.system(size: 12))
+                                }
                                 Text(p.name).font(ui(11)).lineLimit(1)
                                 Spacer(minLength: 0)
                                 Text("clone").font(ui(9))
                             }
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(theme.muted)
                             .padding(.horizontal, 10).padding(.vertical, 3)
                             .contentShape(Rectangle())
                         }
@@ -377,6 +417,13 @@ struct SidebarView: View {
             .onDrop(of: [.text], delegate: TabReorderDrop(
                 targetId: tab.id, drag: $drag, controller: controller,
                 sameGroup: sameShownGroup, end: endDrag))
+            .contextMenu {
+                if tab.opts.guest == nil {
+                    Button("Invite to Session…") { Collab.shared.invite(tab) }
+                } else {
+                    Button("Leave Session") { controller.closeTab(tab.id) }
+                }
+            }
     }
 
     /// Whether two tabs are drawn in the same repo group under the same tier (frozen while the
@@ -941,7 +988,9 @@ private struct ProjectRow: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(Emoji.forPath(project.path)).font(.system(size: 12))
+            if AppModel.shared.theme.user.emoticons {
+                Text(Emoji.forPath(project.path)).font(.system(size: 12))
+            }
             Text(project.name).font(ui(11)).lineLimit(1)
             if flagged != nil { Text("⚑").font(ui(9)).foregroundStyle(.secondary).fixedSize() }
             Spacer(minLength: 0)
@@ -1007,6 +1056,16 @@ private struct ProjectLinksMenu: View {
             Button("Open Repo Page (\(url.host ?? "web"))") { NSWorkspace.shared.open(url) }
         } else {
             Button("No Git Remote") {}.disabled(true)
+        }
+        // Jobs are the main app's (Knife 2 doesn't sync): from Knife 2 this would rewrite the main
+        // app's ~/.knife/manifest.json with only this account's projects.
+        if let remote, !Instance.isSecondary {
+            let tag = Manifest.tags[remote]
+            Menu("Run Jobs On" + (tag.map { " (\($0))" } ?? "")) {
+                Button("auto — the executor") { Manifest.setRunOn(remote: remote, tag: nil) }
+                ForEach(Manifest.machines, id: \.self) { m in Button(m) { Manifest.setRunOn(remote: remote, tag: m) } }
+                Button("cloud — the Claude app, not Knife") { Manifest.setRunOn(remote: remote, tag: "cloud") }
+            }
         }
     }
 }
@@ -1279,7 +1338,10 @@ struct FooterBar: View {
     @AppStorage("chatView") private var chatView = false
     @AppStorage("autoClaude") private var autoClaude = true   // see KnifeWindowController.autoClaude
     @State private var hooksOn = HooksInstaller.installed()
+    @State private var executor = AppModel.shared.executor
     @State private var ctxScope: String? = nil
+    @AppStorage("questionTimeout") private var questionTimeout: Double = 300 // TabModel.questionTimeout reads the same key
+    private static let timeouts: [(String, Double)] = [("off", 0), ("1 min", 60), ("2 min", 120), ("5 min", 300), ("10 min", 600), ("30 min", 1800)]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1317,13 +1379,19 @@ struct FooterBar: View {
                 btn(autoClaude ? "claude on" : "claude off", on: autoClaude,
                     help: autoClaude ? "new tabs start Claude Code — ⌥⌘T or shift-click “new tab” for a plain shell"
                                      : "new tabs open a plain shell — click to start Claude Code in them") { autoClaude.toggle() }
+                btn("style: " + theme.user.id, help: "style profile — house: CW&T; plain: no emoticons, no bold, no grey-on-black, 12pt; ghostty: Ghostty colors, JetBrains Mono, Helvetica Now") { theme.cycleUser() }
                 btn(hooksOn ? "alerts on" : "alerts off", on: hooksOn, help: "Claude Code hooks for working/attention alerts") {
                     _ = HooksInstaller.install(); hooksOn = HooksInstaller.installed()
                 }
                 btn("set default", help: "make Knife the default terminal") { DefaultTerminal.register() }
+                btn(executor ? "jobs: here" : "jobs: off", on: executor, help: "this Mac runs the phone's requests (jobs, project taps) — off when another Mac is the executor") {
+                    AppModel.shared.executor.toggle(); executor = AppModel.shared.executor
+                }
+                sep
+                autoPickMenu
                 Spacer(minLength: 8)
                 Text("\(Instance.label)v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
-                    .font(ui(9)).foregroundStyle(.tertiary).fixedSize()
+                    .font(ui(9)).foregroundStyle(theme.faint).fixedSize()
             }
             .padding(.horizontal, 10).padding(.vertical, 5)
         }
@@ -1334,6 +1402,28 @@ struct FooterBar: View {
     }
 
     private var sep: some View { Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14) }
+
+    /// How long an agent's multiple-choice question waits before Knife picks its first option
+    /// (TabModel.autoAnswer); while one is pending in this tab the label counts down to it.
+    private var autoPickMenu: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in autoPickLabel(now: ctx.date) }
+    }
+
+    private func autoPickLabel(now: Date) -> some View {
+        let name = Self.timeouts.first { $0.1 == questionTimeout }?.0 ?? "\(Int(questionTimeout))s"
+        let left: Int? = controller.activeTab?.askDeadline.map { max(0, Int($0.timeIntervalSince(now).rounded(.up))) }
+        let label = left.map { String(format: "auto-pick %d:%02d", $0 / 60, $0 % 60) } ?? ("auto-pick: " + name)
+        return Menu {
+            ForEach(Self.timeouts, id: \.1) { t in
+                Button((t.1 == questionTimeout ? "✓ " : "   ") + t.0) { questionTimeout = t.1 }
+            }
+        } label: {
+            Text(label)
+        }
+        .menuStyle(.button).menuIndicator(.hidden).fixedSize()
+        .buttonStyle(FootButtonStyle(on: left != nil, paper: Color(nsColor: theme.nsColor(theme.current.background))))
+        .help("a question left alone this long takes its first (recommended) option")
+    }
 
     private func btn(_ label: String, on: Bool = false, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) { Text(label) }
@@ -1374,6 +1464,7 @@ struct FootButtonStyle: ButtonStyle {
 
 struct TabRow: View {
     @ObservedObject var tab: TabModel
+    @ObservedObject var theme = AppModel.shared.theme
     let active: Bool
     /// The header it's listed under, whose name the label doesn't repeat (TabGroups.label).
     var groupName: String? = nil
@@ -1381,29 +1472,24 @@ struct TabRow: View {
     let activate: () -> Void
     let close: () -> Void
     let rename: () -> Void
-    @ObservedObject var theme = AppModel.shared.theme
     @State private var hovering = false
-    @State private var pulse = false
 
     private var accent: Color { theme.accentColor }
     private var signalOrange: Color { theme.attentionColor }
 
     var body: some View {
         HStack(spacing: 6) {
-            Circle()
-                .fill(tab.attention ? signalOrange : (tab.working ? accent : .clear))
-                .frame(width: 6, height: 6)
-                .opacity(isPulsing && pulse ? 0.25 : 1.0)
-                .animation(isPulsing ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : .default, value: pulse)
-                .onAppear { pulse = isPulsing }
-                .onChange(of: isPulsing) { _, now in pulse = now }
-            Text(tab.emoji).font(.system(size: 12))
+            PulseDot(color: tab.attention ? signalOrange : (tab.working ? accent : .clear), size: 6, pulsing: isPulsing)
+            if theme.user.emoticons {
+                Text(tab.emoji).font(.system(size: 12))
+            }
             label.font(ui(11, bold: active)).lineLimit(1).truncationMode(.tail)
-                .foregroundStyle(active ? Color.primary : Color.secondary)
+                .foregroundStyle(active ? theme.tabActive : theme.tabInactive)
             Spacer(minLength: 0)
+            if tab.opts.guest != nil { Text("shared").font(mono(9)).foregroundStyle(.secondary) }
             if hovering {
                 Button(action: close) {
-                    Text("×").font(ui(11)).foregroundStyle(.secondary)
+                    Text("×").font(ui(11)).foregroundStyle(theme.muted)
                 }
                 .buttonStyle(.plain)
             } else if let word = statusWord {
@@ -1451,6 +1537,7 @@ struct TabRow: View {
 struct ContextPanel: View {
     let scope: String
     let cwd: String?
+    @ObservedObject var theme = AppModel.shared.theme
 
     var body: some View {
         let home = NSHomeDirectory()
@@ -1463,16 +1550,16 @@ struct ContextPanel: View {
             if result.files.isEmpty {
                 Text(scope == "global" ? "no global context files"
                      : (cwd != nil ? "no project context files" : "no shell running in this tab"))
-                    .font(ui(10)).foregroundStyle(.secondary)
+                    .font(ui(10)).foregroundStyle(theme.muted)
             }
             ForEach(result.files) { f in
                 Button(action: { NSWorkspace.shared.open(URL(fileURLWithPath: f.path)) }) {
                     HStack(spacing: 8) {
                         Text((f.path as NSString).lastPathComponent).font(ui(10, bold: true))
-                        Text(short((f.path as NSString).deletingLastPathComponent)).font(ui(9)).foregroundStyle(.secondary).lineLimit(1)
+                        Text(short((f.path as NSString).deletingLastPathComponent)).font(ui(9)).foregroundStyle(theme.muted).lineLimit(1)
                         Spacer()
                         Text(f.size < 1024 ? "\(f.size)b" : String(format: "%.1fk", Double(f.size) / 1024))
-                            .font(ui(9)).foregroundStyle(.tertiary)
+                            .font(ui(9)).foregroundStyle(theme.faint)
                     }
                     .contentShape(Rectangle())
                 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import KnifeKit
 
 /// The active tab's claude/codex session as chat (footer 'chat', ⌘⌥C): messages in full and in
@@ -9,7 +10,8 @@ import KnifeKit
 /// led by the model + effort of the latest turn — click it to change either.
 /// Replies render as rich text (headings, lists, code, tables), colored by kind.
 /// ⌘F finds within the session: every hit highlighted, ⌘G / ⌘⇧G step through them.
-/// Lines typed in the composer go to the tab like the phone's. No transcript → the terminal.
+/// Lines typed in the composer go to the tab like the phone's; a leading / lists the CLI's slash
+/// commands (built-ins + skills on disk), ↑↓ Tab ⏎ complete, a known command tints the field. No transcript → the terminal.
 struct ChatPane: View {
     @ObservedObject var controller: KnifeWindowController
     @ObservedObject var tab: TabModel
@@ -30,6 +32,7 @@ struct ChatPane: View {
     @State private var askPicked: [String: [Int: Set<Int>]] = [:] // question card → question → options clicked here
     @State private var query = ""
     @State private var hit = 0
+    @State private var dropped = "" // files dropped on the pane, quoted — the composer appends them to its draft
     @FocusState private var findFocused: Bool
 
     // ponytail: hits are per message — ⌘G jumps message to message, all occurrences inside one
@@ -67,7 +70,9 @@ struct ChatPane: View {
             while !Task.isCancelled {
                 cwd = tab.currentCwd
                 let src = TranscriptReader.source(for: tab, cwd: cwd)
-                let chat = await Task.detached { TranscriptReader.chat(src) }.value
+                var chat: (msgs: [ChatMessage], codex: Bool)?
+                if let g = tab.opts.guest { chat = (Collab.shared.chat(g), false) } // the host's mirrored transcript
+                else { chat = await Task.detached { TranscriptReader.chat(src) }.value }
                 guard !Task.isCancelled else { return } // switched tabs mid-read: don't paint the old tab's chat
                 // unchanged → no assignment: a new array re-lays out the lazy list mid-scroll
                 let new = chat?.msgs ?? []
@@ -98,6 +103,9 @@ struct ChatPane: View {
                     .textSelection(.enabled)
                 }
                 .defaultScrollAnchor(.bottom)
+                .onAppear { // lazy rows at the bottom anchor aren't realized until a scroll: nudge once laid out
+                    DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
                 .onChange(of: prompt) {
                     guard prompt != nil, currentHit == nil else { return }
                     DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -126,11 +134,21 @@ struct ChatPane: View {
                 .padding(.horizontal, 16).padding(.top, 8)
             }
             // its own view: a keystroke re-renders the field, not every message above it
-            Composer(font: mono(12), controller: controller) { text in
+            Composer(font: mono(12), controller: controller, codex: codex, cwd: cwd, accent: accent, dropped: $dropped) { text in
                 tab.whenAgentUp { tab.view.typeLine(text) }
                 // shown at once; the transcript's copy (user record or queue entry) replaces it
                 echoes.append((text.trimmingCharacters(in: .whitespacesAndNewlines), Date()))
             }
+        }
+        // files dropped anywhere on the chat land in the composer as shell-quoted paths, like a drop on the terminal
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            for p in providers {
+                p.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                    guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                    DispatchQueue.main.async { dropped += shellQuote(url.path) + " " }
+                }
+            }
+            return !providers.isEmpty
         }
     }
 
@@ -140,8 +158,11 @@ struct ChatPane: View {
     private var workingRow: some View {
         let live = msgs.last.flatMap { $0.kind == .tool ? $0 : nil }
         VStack(alignment: .leading, spacing: 2) {
-            Text("working…" + (live.map { " › " + $0.text } ?? "")).font(mono(11)).lineLimit(1).foregroundStyle(.secondary)
-            if let d = live?.detail { Text(d).font(mono(10)).lineLimit(6).foregroundStyle(.tertiary).padding(.leading, 12) }
+            HStack(spacing: 6) {
+                PulseDot(color: accent, size: 6)
+                Text("working…" + (live.map { " › " + $0.text } ?? "")).font(mono(11)).lineLimit(1).foregroundStyle(theme.muted)
+            }
+            if let d = live?.detail { Text(d).font(mono(10)).lineLimit(6).foregroundStyle(theme.faint).padding(.leading, 12) }
         }
     }
 
@@ -152,10 +173,10 @@ struct ChatPane: View {
         case .user:
             // detail "queued" (waiting for Claude's turn to end) / "sending" (local echo): dimmer, tagged
             VStack(alignment: .trailing, spacing: 2) {
-                plain(m.text, cur).font(mono(12)).foregroundStyle(m.detail == nil ? .primary : .secondary)
+                plain(m.text, cur).font(mono(12)).foregroundStyle(m.detail == nil ? AnyShapeStyle(.primary) : theme.muted)
                     .padding(.horizontal, 10).padding(.vertical, 6)
                     .background(accent.opacity(m.detail == nil ? 0.25 : 0.12))
-                if let d = m.detail { Text(d).font(mono(9)).foregroundStyle(.tertiary) }
+                if let d = m.detail { Text(d).font(mono(9)).foregroundStyle(theme.faint) }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
@@ -181,7 +202,7 @@ struct ChatPane: View {
                 }
                 if open, let d = m.detail { plain(d, cur).font(mono(10)).padding(.leading, 12) }
             }
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(theme.faint)
         }
     }
 
@@ -194,8 +215,9 @@ struct ChatPane: View {
 
     private var paper: Color { Color(nsColor: theme.nsColor(theme.current.background)) }
 
-    /// Only the newest unanswered question is live — that's the one on the terminal.
-    private var liveAskId: String? { msgs.last { $0.ask != nil }.flatMap { $0.answers == nil ? $0.id : nil } }
+    /// Only the newest unanswered question is live — that's the one on the terminal. Codex's
+    /// never are: its picker sits behind ⌥↑ and takes other keys, so the card only shows the question.
+    private var liveAskId: String? { codex ? nil : msgs.last { $0.ask != nil }.flatMap { $0.answers == nil ? $0.id : nil } }
 
     @ViewBuilder
     private func askCard(_ m: ChatMessage, _ qs: [AskQuestion], _ cur: Bool) -> some View {
@@ -242,7 +264,7 @@ struct ChatPane: View {
             }
             Text(m.answers == nil ? (live ? "waiting for your answer" : "not answered")
                  : m.answers!.isEmpty ? "dismissed" : "answered")
-                .font(mono(9)).foregroundStyle(.tertiary)
+                .font(mono(9)).foregroundStyle(theme.faint)
         }
         .padding(10)
         .overlay(Rectangle().stroke(live ? ansi(3) : Color.primary.opacity(0.15), lineWidth: 1))
@@ -269,7 +291,7 @@ struct ChatPane: View {
                 }
                 .buttonStyle(FootButtonStyle(paper: paper, wrap: true))
             }
-            Text("waiting for your answer").font(mono(9)).foregroundStyle(.tertiary)
+            Text("waiting for your answer").font(mono(9)).foregroundStyle(theme.faint)
         }
         .padding(10)
         .overlay(Rectangle().stroke(ansi(3), lineWidth: 1))
@@ -340,7 +362,7 @@ struct ChatPane: View {
             Button { toggle(id) } label: {
                 Text((open ? "⌄ " : "› ") + "\(run.count) tools · "
                      + counts.map { $0.1 > 1 ? "\($0.0) ×\($0.1)" : $0.0 }.joined(separator: ", "))
-                    .font(mono(10)).lineLimit(1).foregroundStyle(.tertiary)
+                    .font(mono(10)).lineLimit(1).foregroundStyle(theme.faint)
                     .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -452,8 +474,8 @@ struct ChatPane: View {
         for m in KnifeTermView.urlDetector?.matches(in: text, range: all) ?? [] {
             if let url = m.url { link(m.range, url) }
         }
-        for m in KnifeTermView.tokenRegex.matches(in: text, range: all) {
-            guard let (url, lineRef, r) = KnifeTermView.fileLink(token: (text as NSString).substring(with: m.range), at: m.range, cwd: cwd) else { continue }
+        let found = KnifeTermView.fileLinks(in: text) { KnifeTermView.fileLink(token: $0, at: NSRange(location: 0, length: ($0 as NSString).length), cwd: cwd) }
+        for (url, lineRef, r, _) in found {
             link(r, lineRef.flatMap { URL(string: url.absoluteString + "#" + $0) } ?? url)
         }
     }
@@ -490,7 +512,7 @@ struct ChatPane: View {
                 .onSubmit { step(NSEvent.modifierFlags.contains(.shift) ? -1 : 1); findFocused = true }
                 .onChange(of: query) { hit = 0 }
             Text(hits.isEmpty ? (query.isEmpty ? "" : "none") : "\(min(hit, hits.count - 1) + 1)/\(hits.count)")
-                .font(mono(10)).foregroundStyle(.secondary)
+                .font(mono(10)).foregroundStyle(theme.muted)
             Button { step(-1) } label: { Text("↑").font(mono(12)) }.buttonStyle(.plain)
             Button { step(1) } label: { Text("↓").font(mono(12)) }.buttonStyle(.plain)
             Button { closeFind() } label: { Text("done").font(mono(10)) }.buttonStyle(.plain)
@@ -563,25 +585,96 @@ struct ChatPane: View {
 private struct Composer: View {
     let font: Font
     let controller: KnifeWindowController // whose sidebar prompts and clips land in this draft
+    let codex: Bool
+    let cwd: String?
+    let accent: Color
+    @Binding var dropped: String // set by the pane's drop handler; taken into the draft here
     let send: (String) -> Void
     @State private var draft = ""
     @FocusState private var focused: Bool
+    @State private var pick = 0 // highlighted row of the slash menu
+
+    /// Slash commands the CLI will take: its built-ins, plus skills + custom commands on disk
+    /// (~/.claude/commands/*.md, ~/.claude/skills/*/ — Knife 2's config dir instead — and the project's .claude/ copies).
+    /// ponytail: the built-in list is static — a new CLI release means editing it here.
+    private var commands: [String] {
+        if codex {
+            return ["approvals", "clear", "compact", "diff", "init", "logout", "mcp", "mention", "model", "new", "quit", "review", "status"]
+        }
+        var out: Set<String> = ["add-dir", "agents", "bug", "clear", "compact", "config", "context", "cost", "doctor", "effort", "exit",
+            "export", "fast", "feedback", "help", "hooks", "ide", "init", "keybindings", "login", "logout", "mcp", "memory", "model",
+            "permissions", "plugin", "pr-comments", "release-notes", "rename", "resume", "review", "rewind", "sandbox", "security-review",
+            "skills", "stats", "status", "statusline", "tasks", "terminal-setup", "theme", "usage", "vim", "workflows"]
+        let fm = FileManager.default
+        for root in [Instance.claudeDir, cwd.map { $0 + "/.claude" }].compactMap({ $0 }) {
+            for f in (try? fm.contentsOfDirectory(atPath: root + "/commands")) ?? [] where f.hasSuffix(".md") { out.insert(String(f.dropLast(3))) }
+            for d in (try? fm.contentsOfDirectory(atPath: root + "/skills")) ?? [] where fm.fileExists(atPath: root + "/skills/\(d)/SKILL.md") { out.insert(d) }
+        }
+        return out.sorted()
+    }
+
+    /// The draft is a bare slash token being typed: "/" or "/cle" — nothing after it yet.
+    private var typingCommand: String? {
+        guard draft.hasPrefix("/"), !draft.contains(where: \.isWhitespace) else { return nil }
+        return String(draft.dropFirst())
+    }
+    private var matches: [String] {
+        guard let t = typingCommand else { return [] }
+        let all = commands
+        return t.isEmpty ? all : all.filter { $0.hasPrefix(t) } + all.filter { !$0.hasPrefix(t) && $0.contains(t) }
+    }
+    /// The first word is a known command → the whole field takes the accent color.
+    private var isCommand: Bool {
+        guard draft.hasPrefix("/") else { return false }
+        return commands.contains(String(draft.dropFirst().prefix { !$0.isWhitespace }))
+    }
 
     var body: some View {
-        TextField("message", text: $draft, axis: .vertical)
-            .textFieldStyle(.plain).font(font).lineLimit(1...6)
-            .focused($focused)
-            .padding(.horizontal, 16).padding(.vertical, 10)
-            .onSubmit {
-                guard !draft.isEmpty else { return }
-                send(draft)
-                draft = ""
+        VStack(alignment: .leading, spacing: 0) {
+            if !matches.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(matches.prefix(8).enumerated()), id: \.element) { i, c in
+                        Text("/" + c).font(font).foregroundStyle(i == pick ? accent : Color.primary)
+                            .padding(.horizontal, 16).padding(.vertical, 2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(i == pick ? Color.primary.opacity(0.07) : Color.clear)
+                            .contentShape(Rectangle())
+                            .onTapGesture { complete(c) }
+                    }
+                }
+                .padding(.vertical, 4)
+                .overlay(alignment: .top) { Rectangle().fill(Color.primary.opacity(0.15)).frame(height: 1) }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .knifeChatInsert)) { note in
-                guard note.object as? KnifeWindowController === controller,
-                      let text = note.userInfo?["text"] as? String else { return }
-                draft += text
-                focused = true
-            }
+            TextField("message", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain).font(font).lineLimit(1...6)
+                .focused($focused)
+                .foregroundStyle(isCommand ? accent : Color.primary)
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .onChange(of: draft) { pick = 0 }
+                .onKeyPress(.upArrow) { guard !matches.isEmpty else { return .ignored }; pick = max(0, pick - 1); return .handled }
+                .onKeyPress(.downArrow) { guard !matches.isEmpty else { return .ignored }; pick = min(matches.prefix(8).count - 1, pick + 1); return .handled }
+                .onKeyPress(.tab) { guard !matches.isEmpty else { return .ignored }; complete(matches[pick]); return .handled }
+                .onKeyPress(.escape) { guard !matches.isEmpty else { return .ignored }; draft = ""; return .handled }
+                .onChange(of: dropped) {
+                    guard !dropped.isEmpty else { return }
+                    if !draft.isEmpty, !draft.hasSuffix(" ") { draft += " " }
+                    draft += dropped; dropped = ""
+                }
+                .onSubmit {
+                    guard !draft.isEmpty else { return }
+                    // ⏎ on a partial command completes the highlighted row; ⏎ again sends it
+                    if let t = typingCommand, !matches.isEmpty, matches[pick] != t { complete(matches[pick]); return }
+                    send(draft)
+                    draft = ""
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .knifeChatInsert)) { note in
+                    guard note.object as? KnifeWindowController === controller,
+                          let text = note.userInfo?["text"] as? String else { return }
+                    draft += text
+                    focused = true
+                }
+        }
     }
+
+    private func complete(_ c: String) { draft = "/" + c + " "; pick = 0 }
 }

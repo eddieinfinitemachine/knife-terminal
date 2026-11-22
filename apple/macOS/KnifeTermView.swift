@@ -15,6 +15,7 @@ final class KnifeTermView: LocalProcessTerminalView {
     var onBell: (() -> Void)?
     var onUserInput: (() -> Void)?   // real typing, not ESC[-prefixed reports
     var onInterrupt: (() -> Void)?   // a lone Esc or ^C — stops the agent without a Stop hook
+    var remoteSend: ((ArraySlice<UInt8>) -> Void)? // set on a guest tab: typing goes to the host, there's no local process
     let ring = OutputRingBuffer()
     var editing = Editing()          // what you've typed, for Shift+arrows/⌘X/⌘Z (InputEditing.swift)
     private var findBarWatch: NSKeyValueObservation?
@@ -67,8 +68,9 @@ final class KnifeTermView: LocalProcessTerminalView {
     required init?(coder: NSCoder) { fatalError() }
 
     override func dataReceived(slice: ArraySlice<UInt8>) {
-        ring.append(slice)
-        super.dataReceived(slice: slice)
+        let data = filterForUserStyle(slice)
+        ring.append(data)
+        super.dataReceived(slice: data)
         DispatchQueue.main.async { [weak self] in
             self?.onOutput?()
             self?.scheduleLinkScan()
@@ -76,19 +78,115 @@ final class KnifeTermView: LocalProcessTerminalView {
         }
     }
 
-    override func scrolled(source: TerminalView, position: Double) {
-        super.scrolled(source: source, position: position)
-        scheduleLinkScan()
+    // ─── User style: rewrite SGR sequences in the pty stream ───
+    // SwiftTerm derives its bold face internally with no way to opt out, so a
+    // no-bold user style is enforced on the data itself: bold params are
+    // dropped and grey 256/truecolor foregrounds lifted before the terminal
+    // (or the iOS mirror, which reads the terminal's state) ever sees them.
+    // Set from ThemeManager.style(terminal:); read on the pty feed thread.
+    var stripBold = false
+    var stripGrey = false
+    var greyLiftFg: (r: UInt8, g: UInt8, b: UInt8) = (0xec, 0xec, 0xea)
+    private var pendingCSI: [UInt8] = [] // tail of a chunk-split CSI sequence
+
+    private func filterForUserStyle(_ slice: ArraySlice<UInt8>) -> ArraySlice<UInt8> {
+        guard stripBold || stripGrey else {
+            if pendingCSI.isEmpty { return slice }
+            defer { pendingCSI = [] }
+            return (pendingCSI + slice)[...] // filter just turned off: flush the tail
+        }
+        var data = pendingCSI; pendingCSI = []
+        data.append(contentsOf: slice)
+        var out: [UInt8] = []; out.reserveCapacity(data.count)
+        var i = 0
+        while i < data.count {
+            guard data[i] == 0x1b, i + 1 >= data.count || data[i + 1] == UInt8(ascii: "[") else {
+                out.append(data[i]); i += 1; continue
+            }
+            var j = i + 2 // find the CSI final byte (0x40–0x7e)
+            while j < data.count, !(0x40...0x7e).contains(data[j]) { j += 1 }
+            if j >= data.count {
+                if data.count - i <= 64 { pendingCSI = Array(data[i...]) } // finish next chunk
+                else { out.append(contentsOf: data[i...]) } // too long for SGR; give up on it
+                break
+            }
+            if data[j] == UInt8(ascii: "m") {
+                out.append(contentsOf: rewriteSGR(data[(i + 2)..<j]))
+            } else {
+                out.append(contentsOf: data[i...j])
+            }
+            i = j + 1
+        }
+        return out[...]
     }
 
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
+    /// Params of one SGR sequence in, rewritten full sequence (or nothing) out.
+    private func rewriteSGR(_ params: ArraySlice<UInt8>) -> [UInt8] {
+        let raw = String(decoding: params, as: UTF8.self)
+        let passthrough = Array("\u{1b}[".utf8) + params + [UInt8(ascii: "m")]
+        guard raw.allSatisfy({ $0.isNumber || $0 == ";" }) else { return passthrough } // colon forms etc.
+        let toks = raw.components(separatedBy: ";")
+        var out: [String] = []
+        var i = 0
+        while i < toks.count {
+            let t = toks[i]
+            let n = Int(t)
+            // extended color: 38/48/58 introduce 5;n or 2;r;g;b arguments
+            if let n, n == 38 || n == 48 || n == 58, i + 1 < toks.count, let mode = Int(toks[i + 1]) {
+                if mode == 5, i + 2 < toks.count {
+                    if n == 38, stripGrey, let c = Int(toks[i + 2]), Self.isGrey256(c) {
+                        out += liftedFgToks()
+                    } else {
+                        out += toks[i...i + 2]
+                    }
+                    i += 3; continue
+                }
+                if mode == 2, i + 4 < toks.count {
+                    if n == 38, stripGrey, let r = Int(toks[i + 2]), let g = Int(toks[i + 3]), let b = Int(toks[i + 4]),
+                       (0...255).contains(r), (0...255).contains(g), (0...255).contains(b),
+                       TermTheme.isGrey(UInt8(r), UInt8(g), UInt8(b)) {
+                        out += liftedFgToks()
+                    } else {
+                        out += toks[i...i + 4]
+                    }
+                    i += 5; continue
+                }
+                out.append(t); i += 1; continue
+            }
+            // SGR dim (2) passes through untouched: ghost text — suggested
+            // commands in Claude Code's input row — relies on it to read as
+            // secondary. Only explicitly-grey colors get lifted.
+            if stripBold, n == 1 { i += 1; continue } // bold on
+            out.append(t); i += 1
+        }
+        if out.isEmpty { return [] } // sequence only set bold: drop it whole
+        return Array("\u{1b}[".utf8) + Array(out.joined(separator: ";").utf8) + [UInt8(ascii: "m")]
+    }
+
+    private func liftedFgToks() -> [String] {
+        ["38", "2", String(greyLiftFg.r), String(greyLiftFg.g), String(greyLiftFg.b)]
+    }
+
+    /// 256-color greys: the grey ramp below near-white, and the color cube's
+    /// grey diagonal (95/135/175 levels). 0–15 map to the installed palette,
+    /// which ThemeManager already lifts.
+    private static func isGrey256(_ n: Int) -> Bool {
+        (232...252).contains(n) || n == 59 || n == 102 || n == 145 || n == 188
+    }
+
+    override func scrolled(source: TerminalView, position: Double) {
+        super.scrolled(source: source, position: position)
         scheduleLinkScan()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         scheduleLinkScan() // links weren't tracked while this tab was in the background
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        scheduleLinkScan()
     }
 
     override nonisolated func bell(source: Terminal) {
@@ -100,6 +198,7 @@ final class KnifeTermView: LocalProcessTerminalView {
     //   ⌃Delete / ⌘Delete  delete the whole input line (^E ^U)
     //   Shift+arrows, ⌘X/⌘C/⌘Z/⌘⇧Z  edit what you've typed (editKey)
     //   Delete w/selection erase the highlighted text on the input row
+    //   typing / ⌘V w/selection  replace it
     private var keyMonitor: Any?
 
     private func installKeyMonitor() {
@@ -127,6 +226,12 @@ final class KnifeTermView: LocalProcessTerminalView {
             deleteSelection()
             return nil
         }
+        // Typing (or ⌘V) over a highlight replaces it, as in any text field: erase, then let the key through.
+        if selection.active {
+            let typed = mods.subtracting(.shift).isEmpty && (event.characters?.unicodeScalars.first).map {
+                $0.value >= 0x20 && $0.value != 0x7f && !(0xF700...0xF8FF).contains($0.value) } == true // not control or function keys
+            if typed || (event.keyCode == 9 && mods == [.command]) { deleteSelection() }
+        }
         return event
     }
 
@@ -146,10 +251,19 @@ final class KnifeTermView: LocalProcessTerminalView {
         guard endCol > startCol else { return }
         var seq = ""
         let dc = endCol - cur.x
-        if dc != 0 { seq += String(repeating: dc < 0 ? "\u{1b}[D" : "\u{1b}[C", count: min(abs(dc), 400)) }
-        seq += String(repeating: "\u{7f}", count: min(endCol - startCol, 400))
+        let steps = characters(onRow: row, from: min(cur.x, endCol), to: max(cur.x, endCol))
+        if dc != 0 { seq += String(repeating: dc < 0 ? "\u{1b}[D" : "\u{1b}[C", count: min(steps, 400)) }
+        seq += String(repeating: "\u{7f}", count: min(characters(onRow: row, from: startCol, to: endCol), 400))
         send(txt: seq)
         onUserInput?()
+    }
+
+    /// Characters in columns [from, to) of a screen row. Arrow keys and Delete act on
+    /// characters, and a wide one (CJK, emoji) fills two cells: counting cells would
+    /// overshoot by one per wide character.
+    private func characters(onRow row: Int, from: Int, to: Int) -> Int {
+        guard let line = getTerminal().getLine(row: row) else { return max(0, to - from) }
+        return (max(0, from)..<min(to, getTerminal().cols)).filter { line[$0].width != 0 }.count
     }
 
     // Plain-click link opening runs on a local monitor, not the mouseUp
@@ -178,7 +292,7 @@ final class KnifeTermView: LocalProcessTerminalView {
                   event.modifierFlags.intersection([.command, .control, .shift]).isEmpty
             else { return event }
             let (col, row) = self.cellHit(p)
-            guard row != self.getTerminal().getCursorLocation().y else { return event }
+            guard self.scrolledBack || row != self.getTerminal().getCursorLocation().y else { return event }
             self.rescanLinks()
             if let link = self.linkAt(col: col, row: row) {
                 self.lastOpenedEventTimestamp = event.timestamp
@@ -201,6 +315,7 @@ final class KnifeTermView: LocalProcessTerminalView {
         if data.count == 1, data.first == 0x1b || data.first == 0x03 {
             DispatchQueue.main.async { [weak self] in self?.onInterrupt?() }
         }
+        if let remoteSend { remoteSend(data); return }
         noteSent(data)
         super.send(source: source, data: data)
     }
@@ -210,10 +325,12 @@ final class KnifeTermView: LocalProcessTerminalView {
     /// a CR inside it as a newline — so text goes out in 256-character writes 15 ms apart, newlines
     /// as Ctrl+J, Enter last. (Measured by Origin on 2.1.278: 512 chars per 20 ms stays typed.)
     func typeLine(_ text: String) {
+        if let remoteSend { remoteSend(ArraySlice(Array((text + "\r").utf8))); return } // the host types it (SyncPublisher.consumeInputs)
         var t = Self.typable(text)
         if t.hasSuffix("\\") { t += " " }   // a backslash before Enter makes it a newline
-        let typed = sendTyped(t)
-        DispatchQueue.main.asyncAfter(deadline: .now() + typed + 0.25) { [weak self] in self?.send(txt: "\r") }
+        let enter = sendTyped(t) + 0.25
+        DispatchQueue.main.asyncAfter(deadline: .now() + enter) { [weak self] in self?.send(txt: "\r") }
+        typeFreeAt = Date().addingTimeInterval(enter + 0.05)
     }
 
     /// The same typing without the Enter: the text waits on the input line for you to finish it.
@@ -242,10 +359,25 @@ final class KnifeTermView: LocalProcessTerminalView {
     private func sendTyped(_ t: String) -> TimeInterval {
         let chars = Array(t)
         let chunks = stride(from: 0, to: chars.count, by: 256).map { String(chars[$0..<min($0 + 256, chars.count)]) }
+        // Lines queue behind one another: two started together (phone inputs arriving in
+        // one batch) would otherwise both type first and then both press Enter.
+        let start = max(0, typeFreeAt.timeIntervalSinceNow)
         for (i, c) in chunks.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.015 * Double(i)) { [weak self] in self?.send(txt: c) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + start + 0.015 * Double(i)) { [weak self] in self?.send(txt: c) }
         }
-        return 0.015 * Double(chunks.count)
+        let done = start + 0.015 * Double(chunks.count)
+        typeFreeAt = Date().addingTimeInterval(done + 0.05)
+        return done
+    }
+    private var typeFreeAt = Date.distantPast // when the last typeLine's Enter (or typeText's last chunk) will have gone out
+    var typing: Bool { typeFreeAt > Date() }   // a typeLine/paste is still going out: a bare Enter queues behind it
+
+    /// Paste text as one bracketed paste (no Enter), queued behind any typeLine in flight.
+    func paste(_ text: String) {
+        let s = getTerminal().bracketedPasteMode ? "\u{1b}[200~\(text)\u{1b}[201~" : text
+        let start = max(0, typeFreeAt.timeIntervalSinceNow)
+        DispatchQueue.main.asyncAfter(deadline: .now() + start) { [weak self] in self?.send(txt: s) }
+        typeFreeAt = Date().addingTimeInterval(start + 0.3)
     }
 
     // ─── Copies Knife makes land on the sidebar's clipboard pile ───
@@ -288,7 +420,13 @@ final class KnifeTermView: LocalProcessTerminalView {
         for row in 0..<t.rows {
             guard let line = t.getLine(row: row) else { out.append(""); continue }
             var s = ""
-            for col in 0..<t.cols { let ch = line[col].getCharacter(); s.append(ch == "\u{0}" ? " " : ch) }
+            for col in 0..<t.cols {
+                let cd = line[col]
+                if cd.width == 0 { continue } // second cell of a wide character
+                // CharData.getCharacter() turns anything stored out of line (emoji, clusters) into a space
+                let ch = t.getCharacter(for: cd)
+                s.append(ch == "\u{0}" ? " " : ch)
+            }
             out.append(String(s.reversed().drop(while: { $0 == " " }).reversed()))
         }
         while out.last == "" { out.removeLast() }
@@ -308,6 +446,7 @@ final class KnifeTermView: LocalProcessTerminalView {
             }
             for col in 0..<t.cols {
                 let cd = line[col]
+                if cd.width == 0 { continue } // second cell of a wide character
                 let a = cd.attribute
                 var s = 0
                 if a.style.contains(.bold) { s |= StyledScreen.styleBold }
@@ -317,7 +456,7 @@ final class KnifeTermView: LocalProcessTerminalView {
                 if a.style.contains(.inverse) { s |= StyledScreen.styleInverse }
                 let k = (Self.colorCode(a.fg), Self.colorCode(a.bg), s == 0 ? nil : s)
                 if k != key { flush(); key = k }
-                let ch = cd.getCharacter()
+                let ch = t.getCharacter(for: cd)
                 text.append(ch == "\u{0}" ? " " : ch)
             }
             flush()
@@ -410,11 +549,40 @@ final class KnifeTermView: LocalProcessTerminalView {
         }
     }
 
+    // Resolving a token stats the disk (a relative path tries every ancestor of
+    // the cwd), and the same tokens are on screen scan after scan.
+    // ponytail: whole cache dropped every 5s, so a file created just now links up to 5s late
+    private var fileLinkCache: [String: (URL, String?, NSRange)?] = [:]
+    private var linkLineCache: [String: [(URL, String?, NSRange, NSRange?)]] = [:] // logical line + the row below → its links
+    private var fileLinkCacheAt = Date.distantPast
+    private var fileLinkCacheCwd: String?
+
     private func rescanLinks() {
         guard let det = Self.urlDetector else { return }
         refreshCwdIfStale()
+        if fileLinkCacheCwd != cachedCwd || Date().timeIntervalSince(fileLinkCacheAt) > 5 {
+            fileLinkCache.removeAll(keepingCapacity: true)
+            linkLineCache.removeAll(keepingCapacity: true)
+            fileLinkCacheAt = Date()
+            fileLinkCacheCwd = cachedCwd
+        }
         let t = getTerminal()
         var found: [ScreenLink] = []
+        var rowChars: [Int: (text: String, cols: [Int])] = [:] // one row's text, and the column of each utf16 unit
+        func chars(_ r: Int) -> (text: String, cols: [Int])? {
+            if let c = rowChars[r] { return c }
+            guard r < t.rows, let line = t.getLine(row: r) else { return nil }
+            var text = ""
+            var cols: [Int] = []
+            for col in 0..<t.cols {
+                var ch = t.getCharacter(for: line[col])
+                if ch == "\u{0}" { ch = " " }
+                text.append(ch)
+                for _ in 0..<String(ch).utf16.count { cols.append(col) }
+            }
+            rowChars[r] = (text, cols)
+            return (text, cols)
+        }
         var row = 0
         while row < t.rows {
             guard t.getLine(row: row) != nil else { row += 1; continue }
@@ -422,19 +590,15 @@ final class KnifeTermView: LocalProcessTerminalView {
             var text = ""
             var cellOfUnit: [Int] = [] // utf16 offset → cell ordinal in group
             var rows: [Int] = []
-            var cell = 0
             repeat {
-                guard let line = t.getLine(row: row) else { break }
+                guard let c = chars(row) else { break }
+                let base = rows.count * t.cols
                 rows.append(row)
-                for col in 0..<t.cols {
-                    var ch = line[col].getCharacter()
-                    if ch == "\u{0}" { ch = " " }
-                    text.append(ch)
-                    for _ in 0..<String(ch).utf16.count { cellOfUnit.append(cell) }
-                    cell += 1
-                }
+                text += c.text
+                cellOfUnit += c.cols.map { base + $0 }
                 row += 1
             } while row < t.rows && (t.getLine(row: row)?.isWrapped ?? false)
+            let below = chars(row) // where an agent's own word-wrap continues a path
 
             let ns = text as NSString
             func spansFor(_ range: NSRange) -> [(row: Int, cols: Range<Int>)] {
@@ -451,21 +615,30 @@ final class KnifeTermView: LocalProcessTerminalView {
                 return spans
             }
 
-            var claimed: [NSRange] = []
-            for m in det.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
-                guard let url = m.url else { continue }
-                let spans = spansFor(m.range)
-                guard !spans.isEmpty else { continue }
-                claimed.append(m.range)
-                found.append(ScreenLink(url: url, lineRef: nil, spans: spans))
+            // Most lines are the same text scan after scan (only the spinner line
+            // moves), so the detector runs once per distinct line, not once per scan.
+            let hits: [(URL, String?, NSRange, NSRange?)]
+            let key = text + "\n" + (below?.text ?? "")
+            if let cached = linkLineCache[key] { hits = cached } else {
+                var fresh: [(URL, String?, NSRange, NSRange?)] = []
+                for m in det.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
+                    if let url = m.url { fresh.append((url, nil, m.range, nil)) }
+                }
+                fresh += Self.fileLinks(in: text, below: below?.text, skipping: fresh.map(\.2)) { candidate in
+                    if let hit = self.fileLinkCache[candidate] { return hit }
+                    let resolved = Self.fileLink(token: candidate, at: NSRange(location: 0, length: (candidate as NSString).length), cwd: self.cachedCwd)
+                    self.fileLinkCache.updateValue(resolved, forKey: candidate) // nil is cached too: most tokens are not paths
+                    return resolved
+                }
+                linkLineCache[key] = fresh
+                hits = fresh
             }
-            // File paths: any token that resolves to something on disk.
-            for m in Self.tokenRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
-                guard !claimed.contains(where: { NSIntersectionRange($0, m.range).length > 0 }),
-                      let (url, lineRef, range) = Self.fileLink(token: ns.substring(with: m.range), at: m.range, cwd: cachedCwd)
-                else { continue }
-                let spans = spansFor(range)
+            for (url, lineRef, range, rangeBelow) in hits {
+                var spans = spansFor(range)
                 guard !spans.isEmpty else { continue }
+                if let r = rangeBelow, let b = below, r.length > 0, NSMaxRange(r) <= b.cols.count {
+                    spans.append((row: row, cols: b.cols[r.location]..<b.cols[NSMaxRange(r) - 1] + 1))
+                }
                 found.append(ScreenLink(url: url, lineRef: lineRef, spans: spans))
             }
         }
@@ -473,9 +646,70 @@ final class KnifeTermView: LocalProcessTerminalView {
         refreshLinkOverlay()
     }
 
+    /// The links a click would open right now, for the `tab links` socket verb.
+    func linkSummary() -> String {
+        rescanLinks()
+        return screenLinks.flatMap { l in
+            l.spans.map { "\($0.row) \($0.cols.lowerBound)-\($0.cols.upperBound) \(l.url.absoluteString)\(l.lineRef.map { ":" + $0 } ?? "")" }
+        }.joined(separator: "\n")
+    }
+
     // ─── File paths: underlined like URLs, click shows them in Finder ───
 
     static let tokenRegex = try! NSRegularExpression(pattern: #"\S+"#)
+
+    /// Every file path in `text`: a range in `text`, plus — for a path that continues on the
+    /// row below — a range in `below`. A token that starts an absolute path is extended over
+    /// the tokens after it and the longest run that exists on disk wins, so a path with
+    /// spaces ("/Applications/Knife Terminal.app") links as one. `below` is the next screen
+    /// row: an agent word-wraps its own output, which breaks such a path at one of its spaces.
+    // ponytail: absolute paths only, 12 tokens, one wrapped row; a relative path with spaces
+    // or a path wrapped twice links in pieces or not at all
+    static func fileLinks(in text: String, below: String? = nil, skipping claimed: [NSRange] = [],
+                          resolve: (String) -> (URL, String?, NSRange)?) -> [(URL, String?, NSRange, NSRange?)] {
+        let ns = text as NSString
+        let tokens = tokenRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)).map(\.range)
+            .filter { r in !claimed.contains { NSIntersectionRange($0, r).length > 0 } }
+        let belowNS = (below ?? "") as NSString
+        let belowTokens = tokenRegex.matches(in: below ?? "", options: [], range: NSRange(location: 0, length: belowNS.length)).prefix(12).map(\.range)
+        var out: [(URL, String?, NSRange, NSRange?)] = []
+        var i = 0
+        while i < tokens.count {
+            let start = tokens[i].location
+            let token = ns.substring(with: tokens[i])
+            var hit: (URL, String?, NSRange, NSRange?)?
+            var used = i
+            if let f = token.drop(while: { "('\"`<[{".contains($0) }).first, f == "/" || f == "~" {
+                let last = min(i + 12, tokens.count - 1)
+                if last == tokens.count - 1, let head = belowTokens.first?.location { // the path may run on below
+                    let tail = ns.substring(with: NSRange(location: start, length: NSMaxRange(tokens[last]) - start))
+                    let cut = (tail as NSString).length + 1
+                    for m in belowTokens.reversed() {
+                        let more = belowNS.substring(with: NSRange(location: head, length: NSMaxRange(m) - head))
+                        guard let (url, lineRef, rel) = resolve(tail + " " + more), rel.location < cut - 1, NSMaxRange(rel) > cut else { continue }
+                        hit = (url, lineRef, NSRange(location: start + rel.location, length: cut - 1 - rel.location),
+                               NSRange(location: head, length: NSMaxRange(rel) - cut))
+                        used = last
+                        break
+                    }
+                }
+                var j = last
+                while hit == nil, j > i {
+                    if let (url, lineRef, rel) = resolve(ns.substring(with: NSRange(location: start, length: NSMaxRange(tokens[j]) - start))) {
+                        hit = (url, lineRef, NSRange(location: start + rel.location, length: rel.length), nil)
+                        used = j
+                    }
+                    j -= 1
+                }
+            }
+            if hit == nil, let (url, lineRef, rel) = resolve(token) {
+                hit = (url, lineRef, NSRange(location: start + rel.location, length: rel.length), nil)
+            }
+            if let hit { out.append(hit) }
+            i = used + 1
+        }
+        return out
+    }
 
     /// "(apple/macOS/Foo.swift:12)" → file URL for apple/macOS/Foo.swift, the
     /// "12" line reference, and the range of just the path part; nil when
@@ -498,7 +732,11 @@ final class KnifeTermView: LocalProcessTerminalView {
             path = (path as NSString).expandingTildeInPath
         } else if !path.hasPrefix("/") {
             guard let cwd else { return nil }
-            path = cwd + "/" + path
+            // relative to the cwd, else to the nearest ancestor that has it — an agent sitting
+            // in apple/ that prints apple/macOS/Foo.swift (repo-relative) still gets a link
+            var dir = cwd
+            while dir.count > 1, !FileManager.default.fileExists(atPath: dir + "/" + path) { dir = (dir as NSString).deletingLastPathComponent }
+            path = dir + "/" + path
         }
         path = (path as NSString).standardizingPath
         guard FileManager.default.fileExists(atPath: path) else { return nil }
@@ -592,7 +830,12 @@ final class KnifeTermView: LocalProcessTerminalView {
         return nil
     }
 
+    /// Scrolled into history: clicked rows are then viewport rows, which say nothing
+    /// about where the cursor (a row of the live screen) is.
+    private var scrolledBack: Bool { canScroll && scrollPosition < 1 }
+
     private func placeCursor(col: Int, row: Int) {
+        guard !scrolledBack else { return } // arrow keys from a click in history would walk the shell's history
         let cur = getTerminal().getCursorLocation() // screen-relative, like row/col above
         let dr = row - cur.y
         let dc = col - cur.x
@@ -601,7 +844,10 @@ final class KnifeTermView: LocalProcessTerminalView {
         guard abs(dr) <= 5, dr != 0 || dc != 0 else { return }
         var seq = ""
         if dr != 0 { seq += String(repeating: dr < 0 ? "\u{1b}[A" : "\u{1b}[B", count: abs(dr)) }
-        if dc != 0 { seq += String(repeating: dc < 0 ? "\u{1b}[D" : "\u{1b}[C", count: min(abs(dc), 400)) }
+        if dc != 0 {
+            let steps = characters(onRow: row, from: min(col, cur.x), to: max(col, cur.x))
+            seq += String(repeating: dc < 0 ? "\u{1b}[D" : "\u{1b}[C", count: min(steps, 400))
+        }
         send(txt: seq)
     }
 

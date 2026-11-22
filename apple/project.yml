@@ -11,12 +11,15 @@ settings:
     DEVELOPMENT_TEAM: L6DVQR8JB9
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "1.2.30"
-    CURRENT_PROJECT_VERSION: "1.1.4"  # CFBundleVersion must increase each release — Sparkle compares it
+    MARKETING_VERSION: "1.4.33"
+    CURRENT_PROJECT_VERSION: "1.1.13"  # CFBundleVersion must increase each release — Sparkle compares it
     # CloudKit container the Mac and iOS apps sync through (read at runtime via
     # the KnifeCloudContainer Info.plist key). Override with your own team's
     # container when signing outside CW&T — it must match the entitlements.
     KNIFE_CLOUD_CONTAINER: iCloud.com.cwandt.knifeterminal
+    # Sparkle appcast the Mac app updates from (Info.plist SUFeedURL). A build
+    # that isn't CW&T's overrides it, or the next CW&T release replaces it.
+    KNIFE_FEED_URL: https://raw.githubusercontent.com/cheewee2000/knife-terminal/main/appcast.xml
     # A second Knife for another Claude Code account (`make install-mac-2`, see the Makefile). Empty = the
     # main app. Read at runtime from Info.plist by macOS/Instance.swift.
     KNIFE_APP_NAME: Knife Terminal
@@ -28,7 +31,10 @@ settings:
 packages:
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
-    from: 1.2.0
+    # below 1.99: it makes `selection` internal and drops getTerminal() and the
+    # dataReceived override KnifeTermView is built on
+    minVersion: 1.2.0
+    maxVersion: 1.99.0
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     from: 2.6.0
@@ -68,7 +74,8 @@ targets:
         NSAppleEventsUsageDescription: Knife Terminal opens folders and scripts you send it.
         NSHumanReadableCopyright: CW&T
         KnifeCloudContainer: $(KNIFE_CLOUD_CONTAINER)
-        SUFeedURL: https://raw.githubusercontent.com/cheewee2000/knife-terminal/main/appcast.xml
+        CKSharingSupported: true
+        SUFeedURL: $(KNIFE_FEED_URL)
         SUPublicEDKey: IsZ2LtddRqNHFHsp6U40Gw/A6sWIJO4m5xJYr1r4qic=
         SUEnableAutomaticChecks: true
         CFBundleDocumentTypes:
@@ -138,6 +145,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         UIBackgroundModes: [remote-notification]
         ITSAppUsesNonExemptEncryption: false
+        CKSharingSupported: true
     settings:
       base:
         PRODUCT_NAME: Knife

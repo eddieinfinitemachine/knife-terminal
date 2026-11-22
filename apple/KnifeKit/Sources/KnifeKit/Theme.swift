@@ -42,6 +42,10 @@ public struct TermTheme: Sendable {
             RGB(0x7aa6da), RGB(0xc397d8), RGB(0x70c0b1), RGB(0xeaeaea),
         ])
 
+    // The `ghostty` style's palettes. In this build the default palettes above already are Ghostty's.
+    public static let ghosttyLight = light
+    public static let ghosttyDark = dark
+
     init(background: RGB, foreground: RGB, cursor: RGB, cursorText: RGB,
          accent: RGB, attention: RGB, ansi: [RGB]) {
         self.background = background; self.foreground = foreground

@@ -9,3 +9,4 @@ apple/KnifeKit/.swiftpm/
 apple/macOS/KnifeMacDev.entitlements
 local.mk
 apple/DerivedData2/
+build/

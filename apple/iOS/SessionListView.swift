@@ -94,7 +94,7 @@ struct SessionListView: View {
                                     Button(role: .destructive) {
                                         store.closeTab(tab)
                                     } label: {
-                                        Text("close").font(ui(13))
+                                        Text(tab.share == nil ? "close" : "leave").font(ui(13))
                                     }
                                 }
                             }
@@ -111,9 +111,9 @@ struct SessionListView: View {
                 if !closedProjects.isEmpty {
                     Section {
                         ForEach(closedProjects) { p in
-                            ProjectRow(project: p, pending: store.pendingOpens.contains(p.path)) { agent in
-                                store.openProject(p, agent: agent)
-                            }
+                            ProjectRow(project: p, pending: store.pendingOpens.contains(p.path), machines: store.machines,
+                                       open: { agent in store.openProject(p, agent: agent) },
+                                       setRunOn: { tag in store.setRunOn(p, tag) })
                         }
                     } header: {
                         Text("projects").font(ui(12)).foregroundStyle(.secondary)
@@ -197,29 +197,41 @@ struct SessionListView: View {
 struct ProjectRow: View {
     let project: ProjectRef
     let pending: Bool
+    let machines: [String]
     let open: (String) -> Void   // "claude" | "codex"
     @Environment(\.colorScheme) private var scheme
     private var theme: TermTheme { .current(scheme) }
+    let setRunOn: (String?) -> Void   // machine | "cloud" | nil = the executor
+
+    private var cloud: Bool { project.runOn == "cloud" }
 
     var body: some View {
         HStack(spacing: 8) {
             Text(Emoji.forPath(project.path))
             Text(project.name).font(ui(15)).lineLimit(2)
+            if let w = project.runOn { Text(w).font(ui(11)).foregroundStyle(.secondary).lineLimit(1) }
             Spacer(minLength: 8)
             if pending {
                 ProgressView().controlSize(.small)
             } else {
                 Menu {
-                    Button("open with Claude Code") { open("claude") }
-                    Button("open with Codex") { open("codex") }
+                    if !cloud {
+                        Button("open with Claude Code") { open("claude") }
+                        Button("open with Codex") { open("codex") }
+                    }
+                    Menu("run jobs on" + (project.runOn.map { " (\($0))" } ?? "")) {
+                        Button("auto — the executor") { setRunOn(nil) }
+                        ForEach(machines, id: \.self) { m in Button(m) { setRunOn(m) } }
+                        Button("cloud — the Claude app, not Knife") { setRunOn("cloud") }
+                    }
                 } label: {
-                    Text("open ▾").font(ui(13)).foregroundStyle(theme.accent.color)
+                    Text(cloud ? "cloud ▾" : "open ▾").font(ui(13)).foregroundStyle(theme.accent.color)
                 }
             }
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
-        .onTapGesture { if !pending { open("claude") } } // row tap = Claude, the default agent
+        .onTapGesture { if !pending && !cloud { open("claude") } } // row tap = Claude, the default agent; cloud projects live in the Claude app
     }
 }
 
@@ -245,6 +257,7 @@ struct SessionRow: View {
                 // Titles run long ("✳ Website interactivity and launch dates") — two
                 // lines rather than a cut-off one; the group header carries the status.
                 Text(tab.title).font(ui(15, bold: tab.attention)).lineLimit(2)
+                if tab.share != nil { Text("shared with you").font(ui(11)).foregroundStyle(theme.accent.color) }
                 if let snippet {
                     Text(snippet).font(ui(12)).foregroundStyle(.secondary).lineLimit(2)
                 }

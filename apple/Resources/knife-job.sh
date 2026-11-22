@@ -15,6 +15,7 @@ set -u
 KNIFE=$HOME/.knife
 MANIFEST=${KNIFE_MANIFEST:-$KNIFE/manifest.json}   # overrides: self-check against a scratch repo
 CLONES=${KNIFE_CLONES:-$KNIFE/projects}
+MACHINES=${KNIFE_MACHINES:-$KNIFE/machines.json}   # {"self": [this Mac], "all": [every Mac publishing a manifest]}
 SOCK=${KNIFE_SOCK:-$HOME/.knife-terminal.sock}   # the Knife whose tab runs this job
 mkdir -p "$KNIFE/jobs" "$KNIFE/router" "$CLONES"
 
@@ -40,7 +41,10 @@ sys.stdout.write(out.decode(errors="replace"))' "$SOCK"; }
 # the overseer's Bash is sandboxed (no /dev/tty), but the socket is reachable
 note() { if [ -n "${KNIFE_TAB:-}" ]; then printf 'tab echo %s \033[2m%s\033[0m' "$KNIFE_TAB" "$*" | sock >/dev/null; else echo "$*" >&2; fi; }
 tab() {
-  local verb=${1:-}; shift 2>/dev/null; set -- "${1:-}" "${2:-}"
+  # $1 = the tab id (or, for open/shell, the directory), $2 = everything after it: several
+  # keys, or a question the overseer did not quote, are one argument to the app
+  local verb=${1:-}; shift 2>/dev/null; local first=${1:-}; shift 2>/dev/null; set -- "$first" "$*"
+  case "$verb" in open|shell) set -- "$1${2:+ $2}" "" ;; esac   # a directory with spaces, unquoted
   case "$verb" in
     open|shell) local id; id=$(printf 'tab %s %s' "$verb" "$1" | sock); note "▶ $verb $1 → tab $id"; echo "$id"
                 [ -n "${KNIFE_JOB:-}" ] && echo "$id" >> "$KNIFE_JOB.tabs"   # the runner watches these
@@ -90,21 +94,40 @@ for p in json.load(open(sys.argv[1])):
 PY
 )
   [ -n "$list" ] || fail "manifest is empty — open a project with a git remote first"
+  local machines; machines=$(python3 -c 'import json,sys
+try: print(", ".join(json.load(open(sys.argv[1]))["all"]))
+except Exception: pass' "$MACHINES")
   ask "You route a spoken request to one software project.
 Projects (name | remote | last touched | description):
 $list
 
+Machines that can run it: ${machines:-none}, cloud
+
 Request: \"$1\"
 
-Pick the project the request is about. Recently touched projects are more likely, but a clear name or topic match wins. Reply with only this JSON, nothing else:
-{\"remote\": \"<remote url of the best match>\", \"confidence\": <0.0-1.0>, \"candidates\": [\"<remote>\", \"<remote>\", \"<remote>\"]}
+Pick the project the request is about. Recently touched projects are more likely, but a clear name or topic match wins. If the request says where to run it (\"on the laptop\", \"on the mini\", \"in the cloud\"), map that to a machine name from the list or cloud; otherwise where is null. Reply with only this JSON, nothing else:
+{\"remote\": \"<remote url of the best match>\", \"confidence\": <0.0-1.0>, \"candidates\": [\"<remote>\", \"<remote>\", \"<remote>\"], \"where\": <machine name | \"cloud\" | null>}
 candidates = the 3 most likely remotes, best first." | python3 -c '
 import json, re, sys
 m = re.search(r"\{.*\}", sys.stdin.read(), re.S)
 j = json.loads(m.group(0)) if m else {}
 c = [r for r in j.get("candidates", []) if r][:3] or ([j["remote"]] if j.get("remote") else [])
-print(json.dumps({"remote": j.get("remote") or (c[0] if c else ""), "confidence": float(j.get("confidence", 0) or 0), "candidates": c}))'
+print(json.dumps({"remote": j.get("remote") or (c[0] if c else ""), "confidence": float(j.get("confidence", 0) or 0), "candidates": c, "where": j.get("where")}))'
 }
+
+# where a job runs: the request'"'"'s say-so (if it names a known machine or cloud), else the
+# project'"'"'s run-on tag (manifest runOn, set from the phone or a sidebar), else here.
+# Prints a machine name, cloud, or nothing when it is this Mac. $1 remote, $2 route json.
+where_of() { python3 -c '
+import json, sys
+def load(p, d):
+    try: return json.load(open(p))
+    except Exception: return d
+m = load(sys.argv[2], {"self": [""], "all": []}); j = json.loads(sys.argv[4])
+w = j.get("where")
+if w not in m["all"] + ["cloud"]:
+    w = next((p.get("runOn") for p in load(sys.argv[1], []) if p.get("remote") == sys.argv[3]), None)
+print("" if not w or w == m["self"][0] else w)' "$MANIFEST" "$MACHINES" "$1" "$2"; }
 
 name_of() { python3 -c '
 import json, sys
@@ -113,6 +136,7 @@ for p in json.load(open(sys.argv[1])):
 
 # remote → this machine's checkout (any manifest path that exists here and
 # points at the remote), cloning into $CLONES when there is none
+repo_key() { local r=${1%.git}; r=${r//://}; printf '%s/%s' "$(basename "$(dirname "$r")")" "$(basename "$r")" | tr A-Z a-z; }   # owner/repo, whatever the URL form
 resolve() {
   local p
   p=$(python3 -c '
@@ -124,7 +148,13 @@ for p in json.load(open(sys.argv[1])):
         if got == r: print(p["path"]); break' "$MANIFEST" "$1")
   if [ -z "$p" ]; then
     p="$CLONES/$(basename "${1%.git}")"
-    [ -d "$p/.git" ] || { say "cloning $1" >&2; git clone -q "$1" "$p" >&2 || return 1; }   # stdout is the path
+    if [ -d "$p/.git" ]; then
+      # clones are named after the repo alone: another owner's repo of the same name may be sitting here
+      [ "$(repo_key "$(git -C "$p" remote get-url origin 2>/dev/null)")" = "$(repo_key "$1")" ] ||
+        { say "$p is a clone of a different repository, not $1" >&2; return 1; }
+    else
+      say "cloning $1" >&2; git clone -q "$1" "$p" >&2 || return 1   # stdout is the path
+    fi
   fi
   echo "$p"
 }
@@ -156,6 +186,15 @@ run() {
     remote=${names[$((pick-1))]}
   fi
   name=$(name_of "$remote"); name=${name:-$(basename "${remote%.git}")}
+
+  # not ours? hand it to the Mac it runs on (KNIFE_HERE: it was handed to us, run it)
+  local where; where=$(where_of "$remote" "$r")
+  if [ -z "${KNIFE_HERE:-}" ] && [ -n "$where" ]; then
+    [ "$where" = cloud ] && fail "$name runs in the cloud — open it in the Claude app"
+    say "→ $name runs on $where — forwarding"
+    printf 'forward %s %s' "$where" "$text" | nc -U -w 1 "$SOCK" >/dev/null 2>&1 || fail "could not reach Knife to forward"
+    exit 0
+  fi
   repo=$(resolve "$remote") || fail "could not clone $remote"
 
   # The overseer: a claude session whose only tool is knife-tab. It opens the project
@@ -209,8 +248,8 @@ Never run anything but knife-tab. Never close or kill the tab."
 # is the overseer's next turn instead, and after DONE the tab stays open as a
 # chat with it. Uses $JOB, $name; $1 = the opening prompt.
 drive() {
-  : > "$JOB.tabs"
-  local report sid="" rounds=0 busy id st line w reported="" chat=""
+  : > "$JOB.tabs"; rm -f "$JOB.sid"
+  local report rounds=0 busy id st line w reported="" chat=""
   [ -t 0 ] && chat=1   # a keyboard to chat from (not a pipe/self-check); closing the tab HUPs us, so no EOF handling
   report=$(overseer "$1"); printf '%s\n' "$report" | tee -a "$JOB.out"
   while :; do
@@ -231,7 +270,7 @@ drive() {
     done
     if [ -n "$line" ]; then
       [ -n "$w" ] && { kill "$w" 2>/dev/null; wait "$w" 2>/dev/null; }
-      report=$(overseer "The owner says: $line" "$sid")
+      report=$(overseer "The owner says: $line" "$(cat "$JOB.sid" 2>/dev/null)")
     else
       wait "$w" 2>/dev/null; st=$(cat "$JOB.wait"); rounds=$((rounds+1))
       if [ "$st" = limit ]; then   # the overseer runs on the same account — resuming it now fails too
@@ -240,24 +279,26 @@ drive() {
         [ -n "$chat" ] || return 0
         report=""; continue
       fi
-      report=$(overseer "Tab $busy is now $st. knife-tab read it and continue from step 3." "$sid")
+      report=$(overseer "Tab $busy is now $st. knife-tab read it and continue from step 3." "$(cat "$JOB.sid" 2>/dev/null)")
     fi
     printf '%s\n' "$report" | tee -a "$JOB.out"
   done
 }
 
-# one overseer turn: $1 prompt, $2 session to resume (empty = new) → prints its reply, sets $sid
+# one overseer turn: $1 prompt, $2 session to resume (empty = new) → prints its reply, saves the session id in $JOB.sid
 overseer() {
   local out
   out=$(cd "$KNIFE/jobs" && PATH="$KNIFE/bin:$PATH" KNIFE_JOB="$JOB" claude -p "$1" ${2:+--resume "$2"} --model sonnet \
         --output-format json --allowedTools "Bash(knife-tab:*)" </dev/null)
   sid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("session_id",""))' <<<"$out" 2>/dev/null)
+  [ -n "$sid" ] && echo "$sid" > "$JOB.sid"   # drive calls us in $(…), a subshell: a variable would not reach it
   python3 -c 'import json,sys; print(json.load(sys.stdin).get("result",""))' <<<"$out" 2>/dev/null || printf '%s\n' "$out"
 }
 
 # ─── adopt: make a folder a project (git repo + private GitHub remote) ───
 adopt() {
   cd "$1" || exit 1
+  [ "$(pwd -P)" = "$(cd "$HOME" && pwd -P)" ] && fail "refusing to turn the home directory into a project"
   [ -d .git ] || git init -q
   git rev-parse -q --verify HEAD >/dev/null || { git add -A; git commit -q -m "initial commit" || git commit -q --allow-empty -m "initial commit"; }
   git remote get-url origin >/dev/null 2>&1 || gh repo create "$(basename "$PWD")" --private --source=. --remote=origin --push || exit 1

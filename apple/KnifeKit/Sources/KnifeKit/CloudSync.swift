@@ -7,6 +7,11 @@ import CloudKit
 //   Input — iOS-owned. Keystrokes for a tab; Mac applies to the PTY and deletes.
 //   Alert — Mac-owned. Created on attention; iOS has a visible-push query subscription on it.
 // All reads go through zone-change fetches (no CKQuery), so no indexes are needed.
+//
+// Collaborative mode: the Mac puts a CKShare on one Tab record. A guest (another Apple ID,
+// Mac or iPhone) accepts it, reads that tab from the shared database and writes Input records
+// as children of it — the host consumes those like any other Input. Closing the tab (or the
+// Mac relaunching) deletes the record, which ends the share.
 
 public struct TabSnapshot: Sendable {
     public var tabId: Int
@@ -43,15 +48,26 @@ public struct MirroredTab: Identifiable, Sendable, Codable {
     public var styled: Data
     public var chat: Data
     public var updatedAt: Date
+    public var share: SharedZone?    // set when this tab lives in someone else's zone (collaborative mode)
 
     public init(id: String, tabId: Int, title: String, emoji: String, cwd: String?,
                 order: Int, cols: Int, rows: Int, working: Bool, attention: Bool,
-                styled: Data, chat: Data, updatedAt: Date) {
+                styled: Data, chat: Data, updatedAt: Date, share: SharedZone? = nil) {
         self.id = id; self.tabId = tabId; self.title = title; self.emoji = emoji
         self.cwd = cwd; self.order = order; self.cols = cols; self.rows = rows
         self.working = working; self.attention = attention
-        self.styled = styled; self.chat = chat; self.updatedAt = updatedAt
+        self.styled = styled; self.chat = chat; self.updatedAt = updatedAt; self.share = share
     }
+}
+
+/// Where a shared tab lives: the host's zone in the guest's shared database, and the
+/// CKShare record (deleting it from the shared database is how a guest leaves).
+public struct SharedZone: Codable, Sendable, Hashable {
+    public var owner: String        // host's CloudKit user record name
+    public var zone: String
+    public var shareRecord: String?
+    public var zoneID: CKRecordZone.ID { CKRecordZone.ID(zoneName: zone, ownerName: owner) }
+    public init(owner: String, zone: String, shareRecord: String?) { self.owner = owner; self.zone = zone; self.shareRecord = shareRecord }
 }
 
 public struct RemoteInput: Sendable {
@@ -71,10 +87,24 @@ public struct ProjectRef: Codable, Sendable, Identifiable, Equatable {
     public var remote: String?
     public var description: String?
     public var lastTouched: Date?
+    public var runOn: String?       // where its jobs run: a machine name (Manifest.machine), "cloud", or nil = the executor
     public var id: String { remote ?? path }
 
-    public init(name: String, path: String, remote: String? = nil, description: String? = nil, lastTouched: Date? = nil) {
-        self.name = name; self.path = path; self.remote = remote; self.description = description; self.lastTouched = lastTouched
+    public init(name: String, path: String, remote: String? = nil, description: String? = nil, lastTouched: Date? = nil, runOn: String? = nil) {
+        self.name = name; self.path = path; self.remote = remote; self.description = description; self.lastTouched = lastTouched; self.runOn = runOn
+    }
+
+    /// The run-on tags ride in one extra Projects record ("projects-where", written
+    /// by whoever sets a tag — phone or any Mac) as path-less entries, so no record
+    /// type or field had to be added: merge() strips them and applies the tag.
+    public static let whereMachine = "where"
+    public static func tags(_ lists: [[ProjectRef]]) -> [String: String] {
+        var t: [String: String] = [:]
+        for ref in lists.joined() where ref.path.isEmpty { if let r = ref.remote { t[r] = ref.runOn } }
+        return t
+    }
+    public static func tagRefs(_ tags: [String: String]) -> [ProjectRef] {
+        tags.map { ProjectRef(name: "", path: "", remote: $0.key, runOn: $0.value) }
     }
 
     /// The repo's web page for a git remote: git@host:o/r.git, ssh://git@host:22/o/r,
@@ -82,7 +112,9 @@ public struct ProjectRef: Codable, Sendable, Identifiable, Equatable {
     public static func webURL(forRemote remote: String) -> URL? {
         var r = remote.trimmingCharacters(in: .whitespacesAndNewlines)
         if r.hasSuffix(".git") { r.removeLast(4) }
-        if let m = r.firstMatch(of: #/^(?:ssh://)?[^@/]+@([^:/]+)[:/](?:\d+/)?(.+)$/#) { r = "https://\(m.1)/\(m.2)" }
+        // a port only exists in the ssh:// form; in git@host:123/repo the digits are the owner
+        if let m = r.firstMatch(of: #/^ssh://[^@/]+@([^:/]+)(?::\d+)?/(.+)$/#) { r = "https://\(m.1)/\(m.2)" }
+        else if let m = r.firstMatch(of: #/^[^@/]+@([^:/]+):(.+)$/#) { r = "https://\(m.1)/\(m.2)" }
         guard var c = URLComponents(string: r), c.scheme?.hasPrefix("http") == true, c.host != nil else { return nil }
         c.scheme = "https"; c.user = nil; c.password = nil
         return c.url
@@ -93,7 +125,8 @@ public struct ProjectRef: Codable, Sendable, Identifiable, Equatable {
     /// Sorted newest first.
     public static func merge(_ lists: [[ProjectRef]]) -> [ProjectRef] {
         var byId: [String: ProjectRef] = [:]
-        for ref in lists.joined() {
+        let tags = Self.tags(lists)
+        for ref in lists.joined() where !ref.path.isEmpty {
             guard var cur = byId[ref.id] else { byId[ref.id] = ref; continue }
             if (ref.lastTouched ?? .distantPast) > (cur.lastTouched ?? .distantPast) {
                 cur.name = ref.name; cur.path = ref.path; cur.lastTouched = ref.lastTouched
@@ -101,6 +134,7 @@ public struct ProjectRef: Codable, Sendable, Identifiable, Equatable {
             if cur.description?.isEmpty ?? true, let d = ref.description, !d.isEmpty { cur.description = d }
             byId[ref.id] = cur
         }
+        for (id, tag) in tags { byId[id]?.runOn = tag }
         return byId.values.sorted { ($0.lastTouched ?? .distantPast) > ($1.lastTouched ?? .distantPast) }
     }
 }
@@ -136,6 +170,10 @@ public struct ZoneDelta: Sendable {
     public var closes: [RemoteClose] = []
     public var seens: [RemoteSeen] = []
     public var garbage: [CKRecord.ID] = []     // Alert records: push already fired, nobody reads them
+    public var endedShares: [String] = []      // owners whose shared zone went away (share revoked / tab gone)
+    /// Fetched from scratch (no change token): this is everything in the zone, and it
+    /// carries no deletions, so whatever a cache holds beyond it no longer exists.
+    public var full = false
 }
 
 public final class CloudSync: @unchecked Sendable {
@@ -150,7 +188,12 @@ public final class CloudSync: @unchecked Sendable {
     }()
     public let container: CKContainer
     public let db: CKDatabase
-    public let zoneID = CKRecordZone.ID(zoneName: "KnifeZone", ownerName: CKCurrentUserDefaultName)
+    public var sharedDB: CKDatabase { container.sharedCloudDatabase }
+    public let zoneID: CKRecordZone.ID
+    /// Set on a Mac that joined another Apple ID's zone through a zone-wide share:
+    /// every operation then targets that zone in the shared database, so this
+    /// Mac publishes tabs, consumes requests and routes jobs as a peer there.
+    public let hostZone: SharedZone?
     private let role: String // "mac" | "ios" — namespaces tokens + subscription ids
     private let defaults = UserDefaults.standard
     // Setup (zone + subscriptions) is redone once per process — cheap, idempotent
@@ -186,10 +229,12 @@ public final class CloudSync: @unchecked Sendable {
         }
     }
 
-    public init(role: String) {
+    public init(role: String, hostZone: SharedZone? = nil) {
         self.role = role
+        self.hostZone = hostZone
         container = CKContainer(identifier: Self.containerID)
-        db = container.privateCloudDatabase
+        db = hostZone == nil ? container.privateCloudDatabase : container.sharedCloudDatabase
+        zoneID = hostZone?.zoneID ?? CKRecordZone.ID(zoneName: "KnifeZone", ownerName: CKCurrentUserDefaultName)
     }
 
     public func accountAvailable() async -> Bool {
@@ -199,6 +244,7 @@ public final class CloudSync: @unchecked Sendable {
     // ─── Setup ───
 
     public func ensureZone(force: Bool = false) async throws {
+        if hostZone != nil { return } // the host owns it; a guest can't create zones in the shared database
         if !force, setupDone.contains("zone") { return }
         let res = try await db.modifyRecordZones(saving: [CKRecordZone(zoneID: zoneID)], deleting: [])
         // per-zone failures don't throw at the top level — surface them
@@ -218,6 +264,10 @@ public final class CloudSync: @unchecked Sendable {
 
     /// Recreate the zone after a server-side zoneNotFound and forget the change token.
     private func recoverMissingZone() async throws {
+        if let hostZone {
+            Self.log("host zone \(hostZone.owner) is gone — the share ended; leave it (Shell → Leave Shared Mac)")
+            throw CKError(.zoneNotFound)
+        }
         Self.log("zone missing — recreating, change token dropped")
         changeToken = nil
         try await ensureZone(force: true)
@@ -232,6 +282,18 @@ public final class CloudSync: @unchecked Sendable {
         info.shouldSendContentAvailable = true
         sub.notificationInfo = info
         _ = try await db.modifySubscriptions(saving: [sub], deleting: [])
+        setupDone.insert(id)
+    }
+
+    /// Silent push when a host updates a tab shared with us.
+    public func ensureSharedSubscription() async throws {
+        let id = "knife-shared-\(role)"
+        if setupDone.contains(id) { return }
+        let sub = CKDatabaseSubscription(subscriptionID: id)
+        let info = CKSubscription.NotificationInfo()
+        info.shouldSendContentAvailable = true
+        sub.notificationInfo = info
+        _ = try await sharedDB.modifySubscriptions(saving: [sub], deleting: [])
         setupDone.insert(id)
     }
 
@@ -283,8 +345,16 @@ public final class CloudSync: @unchecked Sendable {
             return r
         }
         try await modify(save: records, delete: nil)
+        updatePublished { for s in snaps { $0.insert("tab-\(s.tabId)") } }
+    }
+
+    /// saveTabs and deleteTabs run on whatever thread their task landed on, sometimes at once
+    /// (a tab closing during a flush): an unguarded read-modify-write lost one of the updates.
+    private let publishedLock = NSLock()
+    private func updatePublished(_ change: (inout Set<String>) -> Void) {
+        publishedLock.lock(); defer { publishedLock.unlock() }
         var published = Set(defaults.stringArray(forKey: publishedKey) ?? [])
-        for s in snaps { published.insert("tab-\(s.tabId)") }
+        change(&published)
         defaults.set(Array(published), forKey: publishedKey)
     }
 
@@ -292,9 +362,7 @@ public final class CloudSync: @unchecked Sendable {
         guard !tabIds.isEmpty else { return }
         let ids = tabIds.map { recordID(forTab: $0) }
         try await modify(save: nil, delete: ids)
-        var published = Set(defaults.stringArray(forKey: publishedKey) ?? [])
-        for t in tabIds { published.remove("tab-\(t)") }
-        defaults.set(Array(published), forKey: publishedKey)
+        updatePublished { for t in tabIds { $0.remove("tab-\(t)") } }
     }
 
     private var publishedKey: String { "knife.publishedTabs" }
@@ -337,7 +405,65 @@ public final class CloudSync: @unchecked Sendable {
         try await modify(save: nil, delete: [CKRecord.ID(recordName: "projects", zoneID: zoneID)])
     }
 
+    // ─── Collaborative mode ───
+
+    /// Host: the CKShare on a tab's record (created if there isn't one). The record must
+    /// already be published. Participants get read/write so they can type.
+    public func share(tabId: Int, title: String) async throws -> CKShare {
+        let root = try await db.record(for: recordID(forTab: tabId))
+        if let ref = root.share, let existing = try? await db.record(for: ref.recordID) as? CKShare { return existing }
+        let share = CKShare(rootRecord: root)
+        share[CKShare.SystemFieldKey.title] = title as CKRecordValue
+        share[CKShare.SystemFieldKey.shareType] = "com.cwandt.knifeterminal.session" as CKRecordValue
+        share.publicPermission = .none
+        try await modify(save: [root, share], delete: nil)
+        Self.log("share saved for tab-\(tabId)")
+        return share
+    }
+
+    /// Host: the zone-wide CKShare on our zone (created if there isn't one) — another
+    /// Mac on a different Apple ID accepts it and runs its whole sync in our zone.
+    /// CloudKit allows either record shares or a zone-wide share in a zone, not both:
+    /// while this exists, Invite to Session fails.
+    public func shareZone() async throws -> CKShare {
+        let id = CKRecord.ID(recordName: CKRecordNameZoneWideShare, zoneID: zoneID)
+        if let existing = try? await db.record(for: id) as? CKShare { return existing }
+        let share = CKShare(recordZoneID: zoneID)
+        share[CKShare.SystemFieldKey.title] = "Knife Terminal" as CKRecordValue
+        share[CKShare.SystemFieldKey.shareType] = "com.cwandt.knifeterminal.zone" as CKRecordValue
+        share.publicPermission = .none
+        try await modify(save: [share], delete: nil)
+        Self.log("zone-wide share saved")
+        return share
+    }
+
+    /// Guest: accept an invitation; the host's zone then shows up in fetchSharedChanges.
+    public func accept(_ metadata: CKShare.Metadata) async throws {
+        _ = try await container.accept(metadata)
+        Self.log("accepted share from \(metadata.share.recordID.zoneID.ownerName)")
+    }
+
+    /// Guest: leave a share (a participant deleting the CKShare removes only themselves).
+    public func leave(_ zone: SharedZone) async throws {
+        guard let name = zone.shareRecord else { return }
+        try await modify(db: sharedDB, save: nil, delete: [CKRecord.ID(recordName: name, zoneID: zone.zoneID)])
+        sharedZoneToken[zone.owner] = nil
+    }
+
     // ─── iOS: send input ───
+
+    /// Typed into a tab: our own Mac's, or a shared one (then the record is a child of the
+    /// host's Tab record, in the host's zone — that's what makes it part of the share).
+    public func sendInput(to tab: MirroredTab, text: String) async throws {
+        guard let zone = tab.share else { return try await sendInput(tabId: tab.tabId, text: text) }
+        let r = CKRecord(recordType: "Input",
+                         recordID: CKRecord.ID(recordName: "input-\(UUID().uuidString)", zoneID: zone.zoneID))
+        r["tabId"] = tab.tabId as CKRecordValue
+        r["data"] = text as CKRecordValue
+        r["ts"] = Date() as CKRecordValue
+        r.parent = CKRecord.Reference(recordID: CKRecord.ID(recordName: "tab-\(tab.tabId)", zoneID: zone.zoneID), action: .none)
+        try await modify(db: sharedDB, save: [r], delete: nil)
+    }
 
     public func sendInput(tabId: Int, text: String) async throws {
         let r = CKRecord(recordType: "Input",
@@ -379,6 +505,9 @@ public final class CloudSync: @unchecked Sendable {
     /// an Open record as "job:<text>" — a new record type would need a
     /// Production schema deploy, and the executor already consumes Opens.
     public static let jobPrefix = "job:"
+    /// An Input whose data is this + base64 JPEG is a photo from the phone: the Mac saves it and
+    /// pastes the path. Rides in Input.data (records cap at 1 MB) — no Production schema deploy.
+    public static let imagePrefix = "\u{1}knife-image:"
     public func sendJob(_ text: String) async throws {
         try await sendOpen(path: Self.jobPrefix + text)
     }
@@ -392,7 +521,7 @@ public final class CloudSync: @unchecked Sendable {
 
     // ─── Zone-change fetch (both sides) ───
 
-    private var tokenKey: String { "knife.zoneToken.\(role)" }
+    private var tokenKey: String { "knife.zoneToken.\(role)" + (hostZone.map { ".host-" + $0.owner } ?? "") }
 
     private var changeToken: CKServerChangeToken? {
         get {
@@ -413,6 +542,7 @@ public final class CloudSync: @unchecked Sendable {
     public func fetchChanges() async throws -> ZoneDelta {
         let t0 = Date()
         var delta = ZoneDelta()
+        delta.full = changeToken == nil
         var more = true
         while more {
             do {
@@ -420,20 +550,7 @@ public final class CloudSync: @unchecked Sendable {
                 for record in mods {
                     switch record.recordType {
                     case "Tab":
-                        delta.tabs.append(MirroredTab(
-                            id: record.recordID.recordName,
-                            tabId: record["tabId"] as? Int ?? 0,
-                            title: record["title"] as? String ?? "shell",
-                            emoji: record["emoji"] as? String ?? "🔪",
-                            cwd: record["cwd"] as? String,
-                            order: record["order"] as? Int ?? 0,
-                            cols: record["cols"] as? Int ?? 80,
-                            rows: record["rows"] as? Int ?? 24,
-                            working: (record["working"] as? Int ?? 0) == 1,
-                            attention: (record["attention"] as? Int ?? 0) == 1,
-                            styled: record["styled"] as? Data ?? Data(),
-                            chat: record["chat"] as? Data ?? Data(),
-                            updatedAt: record["updatedAt"] as? Date ?? .distantPast))
+                        delta.tabs.append(Self.tab(record, share: nil))
                     case "Input":
                         delta.inputs.append(RemoteInput(
                             recordID: record.recordID,
@@ -473,12 +590,14 @@ public final class CloudSync: @unchecked Sendable {
                 more = moreComing
             } catch where Self.isZoneNotFound(error) {
                 try await recoverMissingZone()
+                delta.full = true
                 return delta // zone is empty right after creation; nothing to fetch
             } catch where changeToken != nil && !Self.isTransient(error) {
                 // expired token, or one minted by another container environment:
                 // start over from scratch (a second failure throws below)
                 Self.log("fetch failed with token, resyncing from scratch: \(error)")
                 changeToken = nil
+                delta.full = true
             } catch {
                 Self.log("fetch failed: \(error)")
                 throw error
@@ -492,7 +611,92 @@ public final class CloudSync: @unchecked Sendable {
         return delta
     }
 
+    private static func tab(_ record: CKRecord, share: SharedZone?) -> MirroredTab {
+        MirroredTab(
+            id: share.map { "\($0.owner)/" }.map { $0 + record.recordID.recordName } ?? record.recordID.recordName,
+            tabId: record["tabId"] as? Int ?? 0,
+            title: record["title"] as? String ?? "shell",
+            emoji: record["emoji"] as? String ?? "🔪",
+            cwd: record["cwd"] as? String,
+            order: record["order"] as? Int ?? 0,
+            cols: record["cols"] as? Int ?? 80,
+            rows: record["rows"] as? Int ?? 24,
+            working: (record["working"] as? Int ?? 0) == 1,
+            attention: (record["attention"] as? Int ?? 0) == 1,
+            styled: record["styled"] as? Data ?? Data(),
+            chat: record["chat"] as? Data ?? Data(),
+            updatedAt: record["updatedAt"] as? Date ?? .distantPast,
+            share: share)
+    }
+
+    // ─── Guest: tabs shared with us ───
+
+    private var sharedDBTokenKey: String { "knife.sharedDbToken.\(role)" }
+    private var sharedZoneToken: [String: Data] {   // owner → archived CKServerChangeToken
+        get { defaults.dictionary(forKey: "knife.sharedZoneTokens.\(role)") as? [String: Data] ?? [:] }
+        set { defaults.set(newValue, forKey: "knife.sharedZoneTokens.\(role)") }
+    }
+
+    /// Tabs shared with us that changed, and shares that ended. Zone discovery goes through
+    /// database changes (a new share = a new zone); each zone then has its own change token.
+    public func fetchSharedChanges() async throws -> ZoneDelta {
+        var delta = ZoneDelta()
+        let dbToken = defaults.data(forKey: sharedDBTokenKey)
+            .flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: CKServerChangeToken.self, from: $0) }
+        let (changed, gone, newDBToken) = try await databaseChanges(db: sharedDB, since: dbToken)
+        var tokens = sharedZoneToken
+        for z in gone { delta.endedShares.append(z.ownerName); tokens[z.ownerName] = nil }
+        for z in changed where z != hostZone?.zoneID {   // the zone we run in is fetchChanges' job
+            let since = tokens[z.ownerName].flatMap { try? NSKeyedUnarchiver.unarchivedObject(ofClass: CKServerChangeToken.self, from: $0) }
+            var more = true, token = since
+            while more {
+                let res: (mods: [CKRecord], deletions: [String], token: CKServerChangeToken?, more: Bool)
+                do { res = try await zoneChanges(db: sharedDB, zoneID: z, since: token) }
+                catch where Self.isZoneNotFound(error) { delta.endedShares.append(z.ownerName); tokens[z.ownerName] = nil; break }
+                for r in res.mods where r.recordType == "Tab" {
+                    delta.tabs.append(Self.tab(r, share: SharedZone(owner: z.ownerName, zone: z.zoneName, shareRecord: r.share?.recordID.recordName)))
+                }
+                delta.deletedTabRecordNames.append(contentsOf: res.deletions.filter { $0.hasPrefix("tab-") }.map { "\(z.ownerName)/\($0)" })
+                token = res.token; more = res.more
+                if let t = token, let d = try? NSKeyedArchiver.archivedData(withRootObject: t, requiringSecureCoding: true) { tokens[z.ownerName] = d }
+            }
+        }
+        sharedZoneToken = tokens
+        if let t = newDBToken, let d = try? NSKeyedArchiver.archivedData(withRootObject: t, requiringSecureCoding: true) {
+            defaults.set(d, forKey: sharedDBTokenKey)
+        }
+        if !delta.tabs.isEmpty || !delta.endedShares.isEmpty {
+            Self.log("shared: \(delta.tabs.count) tabs, \(delta.deletedTabRecordNames.count) deleted, \(delta.endedShares.count) ended")
+        }
+        return delta
+    }
+
+    private func databaseChanges(db: CKDatabase, since token: CKServerChangeToken?) async throws
+        -> (changed: [CKRecordZone.ID], deleted: [CKRecordZone.ID], token: CKServerChangeToken?) {
+        try await withCheckedThrowingContinuation { cont in
+            let op = CKFetchDatabaseChangesOperation(previousServerChangeToken: token)
+            var changed: [CKRecordZone.ID] = [], deleted: [CKRecordZone.ID] = []
+            op.recordZoneWithIDChangedBlock = { changed.append($0) }
+            op.recordZoneWithIDWasDeletedBlock = { deleted.append($0) }
+            op.recordZoneWithIDWasPurgedBlock = { deleted.append($0) }
+            op.recordZoneWithIDWasDeletedDueToUserEncryptedDataResetBlock = { deleted.append($0) }
+            op.fetchDatabaseChangesResultBlock = { result in
+                switch result {
+                case .success(let (token, _)): cont.resume(returning: (changed, deleted, token))
+                case .failure(let e): cont.resume(throwing: e)
+                }
+            }
+            op.qualityOfService = .userInitiated
+            db.add(op)
+        }
+    }
+
     private func zoneChanges(since token: CKServerChangeToken?) async throws
+        -> (mods: [CKRecord], deletions: [String], token: CKServerChangeToken?, more: Bool) {
+        try await zoneChanges(db: db, zoneID: zoneID, since: token)
+    }
+
+    private func zoneChanges(db: CKDatabase, zoneID: CKRecordZone.ID, since token: CKServerChangeToken?) async throws
         -> (mods: [CKRecord], deletions: [String], token: CKServerChangeToken?, more: Bool) {
         try await withCheckedThrowingContinuation { cont in
             let cfg = CKFetchRecordZoneChangesOperation.ZoneConfiguration()
@@ -522,16 +726,16 @@ public final class CloudSync: @unchecked Sendable {
                 }
             }
             op.qualityOfService = .userInitiated
-            self.db.add(op)
+            db.add(op)
         }
     }
 
     /// Modify records; if the zone vanished (first run, or user wiped iCloud
     /// data), recreate it and retry once. Per-record failures also surface.
-    private func modify(save: [CKRecord]?, delete: [CKRecord.ID]?, retried: Bool = false) async throws {
+    private func modify(db: CKDatabase? = nil, save: [CKRecord]?, delete: [CKRecord.ID]?, retried: Bool = false) async throws {
         do {
-            try await runModify(save: save, delete: delete)
-        } catch where Self.isZoneNotFound(error) && !retried {
+            try await runModify(db: db ?? self.db, save: save, delete: delete)
+        } catch where Self.isZoneNotFound(error) && !retried && db == nil {
             try await recoverMissingZone()
             try await modify(save: save, delete: delete, retried: true)
         } catch {
@@ -540,7 +744,7 @@ public final class CloudSync: @unchecked Sendable {
         }
     }
 
-    private func runModify(save: [CKRecord]?, delete: [CKRecord.ID]?) async throws {
+    private func runModify(db: CKDatabase, save: [CKRecord]?, delete: [CKRecord.ID]?) async throws {
         let op = CKModifyRecordsOperation(recordsToSave: save, recordIDsToDelete: delete)
         op.savePolicy = .allKeys // single writer per record: last write wins
         var recordError: Error?
@@ -556,7 +760,7 @@ public final class CloudSync: @unchecked Sendable {
                 }
             }
             op.qualityOfService = .userInitiated
-            self.db.add(op)
+            db.add(op)
         }
     }
 }

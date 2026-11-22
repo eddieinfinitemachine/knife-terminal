@@ -16,12 +16,17 @@ final class ThemeManager: ObservableObject {
     }
     static let defaultTextSize: CGFloat = 13
     static let textSizes: ClosedRange<CGFloat> = 9...24
+    @Published var user: UserStyle {
+        didSet { UserDefaults.standard.set(user.id, forKey: "userStyle"); apply() }
+    }
     private var appearanceObservation: NSKeyValueObservation?
 
     init() {
         mode = ThemeMode(rawValue: UserDefaults.standard.string(forKey: "theme") ?? "auto") ?? .auto
         let saved = CGFloat(UserDefaults.standard.double(forKey: "textSize")) // 0 when never set
         textSize = saved == 0 ? Self.defaultTextSize : Self.clamped(saved)
+        user = UserStyle.named(UserDefaults.standard.string(forKey: "userStyle"))
+            ?? .forMachine(username: NSUserName(), fullName: NSFullUserName())
         appearanceObservation = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in
             DispatchQueue.main.async { self?.restyleAll() }
         }
@@ -35,7 +40,10 @@ final class ThemeManager: ObservableObject {
         }
     }
 
-    var current: TermTheme { Instance.theme(isDark ? .dark : .light, dark: isDark) }
+    var current: TermTheme {
+        let base = user.ghosttyPalette ? (isDark ? TermTheme.ghosttyDark : .ghosttyLight) : (isDark ? TermTheme.dark : .light)
+        return Instance.theme(base.applying(user, dark: isDark), dark: isDark) // a second Knife tints itself
+    }
 
     func cycle() {
         mode = switch mode { case .auto: .light; case .light: .dark; case .dark: .auto }
@@ -46,6 +54,11 @@ final class ThemeManager: ObservableObject {
 
     /// The chat view's text follows the terminal's size, in proportion.
     var textScale: CGFloat { textSize / Self.defaultTextSize }
+    func cycleUser() {
+        let all = UserStyle.all
+        let i = all.firstIndex(of: user) ?? 0
+        user = all[(i + 1) % all.count]
+    }
 
     func apply() {
         NSApp.appearance = switch mode {
@@ -78,8 +91,9 @@ final class ThemeManager: ObservableObject {
     var accentColor: SwiftUI.Color { Color(nsColor: accent) }
     var attentionColor: SwiftUI.Color { Color(nsColor: attention) }
 
-    static func termFont(size: CGFloat) -> NSFont {
-        NSFont(name: "JetBrains Mono", size: size)
+    static func termFont(size: CGFloat, preferred: String? = nil) -> NSFont {
+        preferred.flatMap { NSFont(name: $0, size: size) }
+            ?? NSFont(name: "JetBrains Mono", size: size)
             ?? NSFont(name: "Space Mono", size: size)
             ?? NSFont(name: "Menlo", size: size)
             ?? NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
@@ -93,6 +107,10 @@ final class ThemeManager: ObservableObject {
 
     func style(terminal: KnifeTermView) {
         let t = current
+        terminal.stripBold = !user.boldText
+        terminal.stripGrey = !user.greyOnBlack && isDark
+        let lift = user.greyReplacementHex.map(TermTheme.RGB.init) ?? t.foreground
+        terminal.greyLiftFg = (lift.r, lift.g, lift.b)
         terminal.installColors(t.ansi.map { SwiftTerm.Color(red8: UInt16($0.r), green8: UInt16($0.g), blue8: UInt16($0.b)) })
         terminal.nativeBackgroundColor = nsColor(t.background)
         terminal.nativeForegroundColor = nsColor(t.foreground)
@@ -100,7 +118,7 @@ final class ThemeManager: ObservableObject {
         terminal.selectedTextBackgroundColor = terminal.findBarVisible ? findHighlight : selectionTint
         // A new font re-fits the grid and resizes the pty (and soft-resets the terminal and drops the
         // selection), so only on a real change — not on every theme flip.
-        let font = Self.termFont(size: textSize)
+        let font = Self.termFont(size: textSize + CGFloat(user.termFontDelta), preferred: user.termFont)
         if terminal.font != font {
             terminal.font = font
             terminal.scheduleLinkScan() // link underlines sit on the old grid until rescanned

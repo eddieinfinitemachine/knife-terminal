@@ -21,7 +21,10 @@ gen:
 mac: gen
 	cd $(APPLE) && xcodebuild -project KnifeTerminal.xcodeproj -scheme KnifeMac \
 		-configuration Debug -derivedDataPath DerivedData -allowProvisioningUpdates \
-		-allowProvisioningDeviceRegistration -skipPackagePluginValidation $(XCODEBUILD_FLAGS) build
+		-allowProvisioningDeviceRegistration -skipPackagePluginValidation $(XCODEBUILD_FLAGS) \
+		SWIFT_OPTIMIZATION_LEVEL=-O SWIFT_COMPILATION_MODE=wholemodule GCC_OPTIMIZATION_LEVEL=s build
+# ^ optimized, but still the Debug configuration: its entitlements point at the
+#   Production CloudKit environment, which a locally signed Release build would not
 
 install-mac: mac
 	rm -rf "/Applications/Knife Terminal.app"
@@ -46,7 +49,8 @@ mac-2: gen
 		-configuration Debug -derivedDataPath DerivedData2 -allowProvisioningUpdates \
 		-allowProvisioningDeviceRegistration -skipPackagePluginValidation $(XCODEBUILD_FLAGS_2) \
 		KNIFE_INSTANCE="$(KNIFE2_ID)" KNIFE_APP_NAME="$(KNIFE2_NAME)" KNIFE_CLAUDE_CONFIG_DIR="$(KNIFE2_CONFIG_DIR)" \
-		KNIFE_TINT="$(KNIFE2_TINT)" KNIFE_ICON=icon-$(KNIFE2_ID) KNIFE_CLOUD_CONTAINER= build
+		KNIFE_TINT="$(KNIFE2_TINT)" KNIFE_ICON=icon-$(KNIFE2_ID) KNIFE_CLOUD_CONTAINER= \
+		SWIFT_OPTIMIZATION_LEVEL=-O SWIFT_COMPILATION_MODE=wholemodule GCC_OPTIMIZATION_LEVEL=s build
 
 install-mac-2: mac-2
 	rm -rf "/Applications/$(KNIFE2_NAME).app"

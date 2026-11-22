@@ -4,11 +4,27 @@ import KnifeKit
 
 /// Mac side of the iOS mirror: publishes Tab records (coalesced), consumes
 /// Input records, creates Alert records for push notifications, and runs the
-/// phone's job requests. One Mac is the executor; run Knife on one Mac.
+/// phone's job requests. Several Macs may run Knife (tab ids are per-machine,
+/// see Manifest.tabIdBase); the one with `executor` on takes the phone's
+/// requests and forwards those whose project runs elsewhere ("@<machine>:…").
 @MainActor
 final class SyncPublisher {
-    let cloud = CloudSync(role: "mac")
+    let cloud: CloudSync
     private var enabled = false
+    static let launched = Date()
+
+    /// The other Apple ID's zone this Mac joined (zone-wide share), if any — see CloudSync.hostZone.
+    static var hostZone: SharedZone? {
+        get { UserDefaults.standard.data(forKey: "knife.hostZone").flatMap { try? JSONDecoder().decode(SharedZone.self, from: $0) } }
+        set { UserDefaults.standard.set(newValue.flatMap { try? JSONEncoder().encode($0) }, forKey: "knife.hostZone") }
+    }
+
+    init() { cloud = CloudSync(role: "mac", hostZone: Self.hostZone); _ = Self.launched }
+
+    func stop() {
+        enabled = false
+        pollTimer?.invalidate(); flushTimer?.invalidate()
+    }
     var subReady = false
     private var dirty: Set<Int> = []          // tab ids with unpublished output
     private var flushTimer: Timer?
@@ -16,8 +32,13 @@ final class SyncPublisher {
     private var lastFlush: [Int: Date] = [:]
     private let minInterval: TimeInterval = 1.5
     private var inFlight = false
+    private var closedInFlight: Set<Int> = [] // tabs closed during the current flush
 
     func start() {
+        // which CloudKit environment this binary talks to — a Development build can't see Production's schema or data
+        let env = SecTaskCreateFromSelf(nil).flatMap {
+            SecTaskCopyValueForEntitlement($0, "com.apple.developer.icloud-container-environment" as CFString, nil) } as? String
+        CloudSync.log("launch: CloudKit environment \(env ?? "default")")
         Task { await setup() }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in
             Task { @MainActor in
@@ -48,11 +69,10 @@ final class SyncPublisher {
                 try await cloud.deleteLegacyProjectsRecord()
                 UserDefaults.standard.set(true, forKey: "knife.legacyProjectsGone")
             }
-            // one-time: re-walk the whole zone so leaked Alert records get purged
-            if !UserDefaults.standard.bool(forKey: "knife.purgedAlerts") {
-                cloud.resetChangeToken()
-                UserDefaults.standard.set(true, forKey: "knife.purgedAlerts")
-            }
+            // re-walk the whole zone each launch: other Macs' project lists and the run-on
+            // tags (Manifest.remoteLists) live in memory only, and an unchanged record
+            // never comes back through an incremental fetch
+            cloud.resetChangeToken()
         } catch {
             NSLog("knife sync: setup failed (will retry): \(error)")
             return
@@ -90,12 +110,28 @@ final class SyncPublisher {
     func tabClosed(_ id: Int) {
         guard enabled else { return }
         dirty.remove(id)
+        if inFlight { closedInFlight.insert(id) }
         Task { try? await cloud.deleteTabs([id]) } // failure logged by CloudSync
+    }
+
+    /// Hand a phone request to the Mac named `machine`: a new Open record it alone consumes.
+    func forward(to machine: String, path: String) {
+        guard enabled else { return }
+        Task { try? await cloud.sendOpen(path: "@\(machine):" + path) }
     }
 
     func publishAlert(tabTitle: String, message: String) {
         guard enabled else { return }
         Task { try? await cloud.publishAlert(tabTitle: tabTitle, message: message) }
+    }
+
+    /// Publish one tab right now (its record must exist before it can be shared). False when iCloud isn't up.
+    func publishNow(_ tab: TabModel) async -> Bool {
+        guard enabled else { return false }
+        while inFlight { try? await Task.sleep(for: .milliseconds(50)) }
+        dirty.insert(tab.id)
+        await flush()
+        return true
     }
 
     private func markDirty(_ id: Int, urgent: Bool) {
@@ -116,32 +152,45 @@ final class SyncPublisher {
     private func flush() async {
         guard enabled, !inFlight, !dirty.isEmpty else { return }
         inFlight = true
-        defer { inFlight = false }
+        var failed = false
+        defer {
+            inFlight = false
+            closedInFlight.removeAll()
+            // whatever was marked dirty while this was in flight had its timer fire into the
+            // guard above and return; without this it waits for the tab's next output
+            if !dirty.isEmpty { scheduleFlush(after: failed ? 10 : minInterval) }
+        }
         let ids = dirty; dirty.removeAll()
         var snaps: [TabSnapshot] = []
+        var sources: [TranscriptReader.Source] = []
         var order = 0
         for wc in AppModel.shared.windows {
             for tab in wc.tabs {
                 defer { order += 1 }
-                guard ids.contains(tab.id) else { continue }
+                guard ids.contains(tab.id), tab.opts.guest == nil else { continue } // guest tabs are someone else's session
                 let cwd = tab.lastReportedCwd ?? tab.opts.cwd
-                // off the main thread: a transcript's first parse can run to hundreds of MB
-                let src = TranscriptReader.source(for: tab, cwd: cwd)
-                let chat = await Task.detached { TranscriptReader.chatData(src) }.value
                 snaps.append(TabSnapshot(tabId: tab.id, title: tab.displayTitle, emoji: tab.emoji,
                                          cwd: cwd, order: order,
                                          cols: tab.cols, rows: tab.rows,
                                          working: tab.working, attention: tab.attention,
-                                         styled: tab.view.styledScreen(),
-                                         chat: chat))
+                                         styled: tab.view.styledScreen()))
+                sources.append(TranscriptReader.source(for: tab, cwd: cwd))
                 lastFlush[tab.id] = Date()
             }
         }
         guard !snaps.isEmpty else { return }
+        // transcripts are files (and, without a hook-reported path, directory scans): read them off the main thread
+        let chats = await Task.detached { sources.map(TranscriptReader.chatData) }.value
+        for i in snaps.indices { snaps[i].chat = chats[i] }
         do { try await cloud.saveTabs(snaps) }
         catch {
-            for s in snaps { dirty.insert(s.tabId) } // retry on next change/poll
+            failed = true
+            for s in snaps where !closedInFlight.contains(s.tabId) { dirty.insert(s.tabId) } // retried by the defer above
         }
+        // a tab closed while its snapshot was on the way up: the save landed after
+        // tabClosed's delete and brought the record back, so delete it again
+        let ghosts = snaps.map(\.tabId).filter(closedInFlight.contains)
+        if !ghosts.isEmpty { try? await cloud.deleteTabs(ghosts) }
     }
 
     // ─── Consuming input from iOS ───
@@ -152,9 +201,11 @@ final class SyncPublisher {
 
     private var consuming = false
     func consumeInputs() async {
-        guard enabled, !consuming else { return } // poll + push overlap; one fetch at a time
+        guard !consuming else { return } // poll + push overlap; one fetch at a time
         consuming = true
         defer { consuming = false }
+        await Collab.shared.pull() // sessions shared with us: needs only the account, not our zone
+        guard enabled else { return }
         guard let delta = try? await cloud.fetchChanges() else { return } // failure already logged by CloudSync
         // other machines' manifest slices → merged file for the job runner
         if !delta.projects.isEmpty || !delta.deletedProjectRecordNames.isEmpty {
@@ -165,11 +216,29 @@ final class SyncPublisher {
         if !delta.garbage.isEmpty { Task { try? await cloud.deleteRecords(delta.garbage) } }
         guard !delta.inputs.isEmpty || !delta.opens.isEmpty || !delta.closes.isEmpty || !delta.seens.isEmpty
         else { return }
+        var consumed: [CKRecord.ID] = []   // another Mac's records stay for it to consume
+        // A record for one of this Mac's tab ids is ours to delete even when the tab is gone;
+        // one written before this launch is for a previous run's tab (ids restart) — never apply it.
+        func target(_ tabId: Int, _ ts: Date, _ id: CKRecord.ID) -> TabModel? {
+            guard Manifest.owns(tabId) else { return nil }
+            consumed.append(id)
+            return ts < Self.launched ? nil : AppModel.shared.tab(tabId)
+        }
         for input in delta.inputs {
-            guard let tab = AppModel.shared.tab(input.tabId) else { continue }
+            guard let tab = target(input.tabId, input.ts, input.recordID) else { continue }
             let text = input.data
+            if text.hasPrefix(CloudSync.imagePrefix) { // phone photo → temp file, path pasted (Claude attaches it)
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("knife-photos")
+                let url = dir.appendingPathComponent("\(UUID().uuidString.prefix(8)).jpg")
+                if let data = Data(base64Encoded: String(text.dropFirst(CloudSync.imagePrefix.count))),
+                   (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) != nil,
+                   (try? data.write(to: url)) != nil {
+                    tab.whenAgentUp { tab.view.paste(url.path + " ") }   // a dormant tab starts its agent first
+                }
+                continue
+            }
             tab.whenAgentUp {   // a dormant tab starts its agent first
-                if text.count > 1, text.hasSuffix("\r") {
+                if text.count > 1 && text.hasSuffix("\r") || text == "\r" && tab.view.typing {
                     tab.view.typeLine(String(text.dropLast()))   // composer text: typed, not pasted
                 } else {
                     tab.view.send(txt: text)
@@ -180,34 +249,41 @@ final class SyncPublisher {
         // "codex:<path>" picks Codex CLI — the Open record can't grow a cmd
         // field without a Production CloudKit schema deploy, so it rides in path
         // "job:<text>" is a request to route + run (see knife-job.sh)
+        // "@<machine>:…" was forwarded by the executor to that Mac (its project runs there)
+        let mine = "@" + Manifest.machine + ":"
         for open in delta.opens where !open.path.isEmpty {
-            if open.path.hasPrefix(CloudSync.jobPrefix) {
-                AppModel.shared.dispatchJob(String(open.path.dropFirst(CloudSync.jobPrefix.count)))
-            } else if open.path.hasPrefix("codex:") {
-                AppModel.shared.openProject(String(open.path.dropFirst(6)), cmd: "codex")
-            } else {
-                AppModel.shared.openProject(open.path, cmd: "claude")
+            var path = open.path, forwarded = false
+            if path.hasPrefix(mine) { path = String(path.dropFirst(mine.count)); forwarded = true }
+            else if path.hasPrefix("@") || !AppModel.shared.executor { continue }
+            consumed.append(open.recordID)
+            // a request that sat a day (its Mac was off, or no Mac was taking requests) is dropped, not sprung on you
+            if open.ts < Date().addingTimeInterval(-86_400) { CloudSync.log("dropped stale request: \(path.prefix(60))"); continue }
+            if path.hasPrefix(CloudSync.jobPrefix) {
+                AppModel.shared.dispatchJob(String(path.dropFirst(CloudSync.jobPrefix.count)), here: forwarded)
+                continue
+            }
+            let project = path.hasPrefix("codex:") ? String(path.dropFirst(6)) : path
+            switch forwarded ? nil : Manifest.merged.first(where: { $0.path == project })?.runOn {
+            case "cloud":
+                publishAlert(tabTitle: (project as NSString).lastPathComponent, message: "runs in the cloud — open it in the Claude app")
+            case let machine? where machine != Manifest.machine:
+                forward(to: machine, path: path)
+            default:
+                AppModel.shared.openProject(project, cmd: path.hasPrefix("codex:") ? "codex" : "claude")
             }
         }
         // phone asked to close a tab
         for close in delta.closes {
-            for wc in AppModel.shared.windows where wc.tabs.contains(where: { $0.id == close.tabId }) {
-                wc.closeTab(close.tabId)
-                break
-            }
+            guard let tab = target(close.tabId, close.ts, close.recordID) else { continue }
+            AppModel.shared.window(of: tab)?.closeTab(tab.id)
         }
         // phone viewed a tab → its "waiting for you" flag is acknowledged
         for seen in delta.seens {
-            if let tab = AppModel.shared.tab(seen.tabId), tab.attention {
-                tab.attention = false
-                tabStateChanged(tab)
-            }
+            guard let tab = target(seen.tabId, seen.ts, seen.recordID) else { continue }
+            if tab.attention { tab.attention = false; tabStateChanged(tab) }
         }
-        try? await cloud.deleteRecords(delta.inputs.map { $0.recordID }
-                                       + delta.opens.map { $0.recordID }
-                                       + delta.closes.map { $0.recordID }
-                                       + delta.seens.map { $0.recordID })
+        try? await cloud.deleteRecords(consumed)
         // phone typed → screen will change; make sure it mirrors back fast
-        for input in delta.inputs { markDirty(input.tabId, urgent: true) }
+        for input in delta.inputs where AppModel.shared.tab(input.tabId) != nil { markDirty(input.tabId, urgent: true) }
     }
 }

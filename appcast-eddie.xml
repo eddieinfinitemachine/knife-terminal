@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The update feed of Eddie's builds (the Fork release workflow points SUFeedURL here).
+     Empty on purpose: those builds are not signed with the Sparkle key, so they are
+     downloaded from the releases page. appcast.xml is CW&T's feed. -->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Knife Terminal (Eddie's build)</title>
+    <link>https://github.com/eddieinfinitemachine/knife-terminal/releases</link>
+    <description>Updates for Eddie's build of Knife Terminal</description>
+    <language>en</language>
+  </channel>
+</rss>

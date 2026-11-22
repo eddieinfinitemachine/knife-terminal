@@ -108,6 +108,7 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
                 t.startDeferred()
             }
         }
+        if let cwd = activeTab?.opts.cwd { Projects.touch(cwd) } // switching to a tab = using its project
         if NSApp.isActive, window?.isKeyWindow ?? false, t.attention {
             t.attention = false
             t.status = t.working ? .working : .idle

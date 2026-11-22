@@ -47,3 +47,7 @@ extension TermTheme.RGB {
     var color: Color { Color(red: Double(r) / 255, green: Double(g) / 255, blue: Double(b) / 255) }
     var uiColor: UIColor { UIColor(red: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1) }
 }
+
+// CW&T's views name the accent and the waiting color directly; here they are the theme's, following light/dark.
+let knifeAccent = Color(UIColor { $0.userInterfaceStyle == .dark ? TermTheme.dark.accent.uiColor : TermTheme.light.accent.uiColor })
+let knifeOrange = Color(UIColor { $0.userInterfaceStyle == .dark ? TermTheme.dark.attention.uiColor : TermTheme.light.attention.uiColor })

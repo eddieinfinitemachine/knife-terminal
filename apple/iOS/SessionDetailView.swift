@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import KnifeKit
+import PhotosUI
 
 struct SessionDetailView: View {
     let tabRecordName: String
@@ -16,6 +17,10 @@ struct SessionDetailView: View {
     /// pinch instead of reflowing, so nothing is squeezed out of the picture.
     @AppStorage("knife.mirrorWrap") private var mirrorWrap = true
     @FocusState private var composing: Bool
+    @State private var photos: [PhotosPickerItem] = []
+    /// Picked, not yet sent: thumbnails above the input; they go out with the next send.
+    @State private var attached: [(id: UUID, thumb: UIImage, b64: String)] = []
+    private var canSend: Bool { !draft.isEmpty || !attached.isEmpty }
 
     private var tab: MirroredTab? { store.tabs.first { $0.id == tabRecordName } }
     private var messages: [ChatMessage] { tab.flatMap { ChatTranscript.decode($0.chat) } ?? [] }
@@ -72,7 +77,7 @@ struct SessionDetailView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     HStack(spacing: 10) {
                         if tab.working {
-                            Circle().fill(theme.accent.color).frame(width: 7, height: 7)
+                            PulseDot(color: theme.accent.color)
                         } else if tab.attention {
                             Circle().fill(theme.attention.color).frame(width: 7, height: 7)
                         }
@@ -182,6 +187,7 @@ struct SessionDetailView: View {
                     if focused { proxy.scrollTo("chat-bottom", anchor: .bottom) }
                 }
             }
+            attachmentStrip
             composer(tab)
         }
     }
@@ -241,7 +247,7 @@ struct SessionDetailView: View {
             if let t = p.title { Text(t).font(ui(13, bold: true)).foregroundStyle(theme.attention.color) }
             ForEach(p.body, id: \.self) { Text($0).font(ui(14)) }
             ForEach(p.options.indices, id: \.self) { i in
-                Button { store.send("\(i + 1)", to: tab.tabId) } label: {
+                Button { store.send("\(i + 1)", to: tab) } label: {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("\(i + 1)").font(ui(14, bold: true))
                         Text(p.options[i]).font(ui(14)).multilineTextAlignment(.leading)
@@ -252,6 +258,14 @@ struct SessionDetailView: View {
                 }
                 .buttonStyle(.plain)
             }
+            if p.multiSelect {
+                Button { store.send(ScreenPrompt.multiSelectSubmit, to: tab) } label: {
+                    Text("submit ›").font(mono(12, bold: true))
+                        .padding(.horizontal, 12).padding(.vertical, 9)
+                        .background(RoundedRectangle(cornerRadius: 10).stroke(knifeAccent, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(12)
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(theme.attention.color, lineWidth: 1))
@@ -259,7 +273,7 @@ struct SessionDetailView: View {
 
     private var workingRow: some View {
         HStack(spacing: 8) {
-            Circle().fill(theme.accent.color).frame(width: 7, height: 7)
+            PulseDot(color: theme.accent.color)
             Text("working…").font(ui(13)).foregroundStyle(.secondary)
         }
     }
@@ -271,6 +285,7 @@ struct SessionDetailView: View {
 
     private func composer(_ tab: MirroredTab) -> some View {
         HStack(alignment: .bottom, spacing: 8) {
+            photoButton(tab, size: 22)
             TextField("Message", text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(ui(15))
@@ -285,10 +300,10 @@ struct SessionDetailView: View {
             Button { submit(tab) } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 30))
-                    .foregroundStyle(draft.isEmpty ? Color.secondary.opacity(0.5) : theme.accent.color)
+                    .foregroundStyle(canSend ? theme.accent.color : Color.secondary.opacity(0.5))
             }
             .buttonStyle(.plain)
-            .disabled(draft.isEmpty)
+            .disabled(!canSend)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(.bar)
@@ -304,7 +319,7 @@ struct SessionDetailView: View {
             MirrorTextView(styled: tab.styled, dark: scheme == .dark,
                            size: CGFloat(mirrorSize), wrap: mirrorWrap)
                 .ignoresSafeArea(.keyboard)
-            terminalInputBar(tab)
+            VStack(spacing: 0) { attachmentStrip; terminalInputBar(tab) }
         }
     }
 
@@ -312,13 +327,20 @@ struct SessionDetailView: View {
         HStack(alignment: .bottom, spacing: 10) {
             if tab.title.hasPrefix("job:"), tab.attention { // routing wants a pick: one tap
                 ForEach(1...3, id: \.self) { n in
-                    Button { store.send("\(n)\r", to: tab.tabId) } label: {
+                    Button { store.send("\(n)\r", to: tab) } label: {
                         Text("\(n)").font(mono(13, bold: true)).frame(width: 28, height: 28)
                             .background(RoundedRectangle(cornerRadius: 6).fill(theme.accent.color.opacity(0.25)))
                     }
                     .buttonStyle(.plain)
                 }
             }
+            if screenPrompt(tab)?.multiSelect == true { // its Submit row has no digit to type
+                Button { store.send(ScreenPrompt.multiSelectSubmit, to: tab) } label: {
+                    Text("submit ›").font(mono(11, bold: true))
+                }
+                .buttonStyle(.plain)
+            }
+            photoButton(tab, size: 15)
             TextField("type here, ⏎ sends", text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(mono(14))
@@ -335,14 +357,75 @@ struct SessionDetailView: View {
             }
             Button { submit(tab) } label: { Text("send").font(ui(13, bold: true)) }
                 .buttonStyle(.plain)
-                .disabled(draft.isEmpty)
+                .disabled(!canSend)
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
         .background(.bar)
     }
 
+    /// Picked photos wait as thumbnails above the input until the next send.
+    private func photoButton(_ tab: MirroredTab, size: CGFloat) -> some View {
+        PhotosPicker(selection: $photos, matching: .images) {
+            Image(systemName: "photo").font(.system(size: size)).foregroundStyle(knifeAccent)
+                .padding(.bottom, size > 20 ? 6 : 0)
+        }
+        .onChange(of: photos) { _, items in
+            guard !items.isEmpty else { return }
+            photos = []
+            Task {
+                for item in items {
+                    guard let data = try? await item.loadTransferable(type: Data.self),
+                          let b64 = Self.jpegBase64(data),
+                          let jpg = Data(base64Encoded: b64), let img = UIImage(data: jpg) else { continue }
+                    attached.append((UUID(), img.preparingThumbnail(of: CGSize(width: 160, height: 160)) ?? img, b64))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var attachmentStrip: some View {
+        if !attached.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(attached, id: \.id) { a in
+                        Image(uiImage: a.thumb).resizable().scaledToFill()
+                            .frame(width: 56, height: 56).clipped()
+                            .overlay(alignment: .topTrailing) {
+                                Button { attached.removeAll { $0.id == a.id } } label: {
+                                    Image(systemName: "xmark.circle.fill").font(.system(size: 16))
+                                        .foregroundStyle(.white, .black.opacity(0.6))
+                                }
+                                .buttonStyle(.plain).padding(2)
+                            }
+                    }
+                }
+                .padding(.horizontal, 12).padding(.top, 8)
+            }
+            .frame(maxWidth: .infinity)
+            .background(.bar)
+        }
+    }
+
+    /// Downscaled JPEG small enough for one CloudKit record (1 MB cap, base64 inflates 4/3).
+    static func jpegBase64(_ data: Data) -> String? {
+        guard let img = UIImage(data: data) else { return nil }
+        for side in [2048.0, 1536, 1024, 768] {
+            let scale = min(1, side / max(img.size.width, img.size.height))
+            let size = CGSize(width: img.size.width * scale, height: img.size.height * scale)
+            let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1
+            let small = UIGraphicsImageRenderer(size: size, format: fmt).image { _ in img.draw(in: CGRect(origin: .zero, size: size)) }
+            if let jpg = small.jpegData(compressionQuality: 0.7), jpg.count < 650_000 { return jpg.base64EncodedString() }
+        }
+        return nil
+    }
+
     private func submit(_ tab: MirroredTab) {
-        store.send(draft + "\r", to: tab.tabId)
+        // each photo lands on the Mac as a pasted path; in a Claude tab a newline (Ctrl+J)
+        // then keeps the message on its own line instead of running into the path
+        for a in attached { store.send(CloudSync.imagePrefix + a.b64, to: tab) }
+        let sep = !attached.isEmpty && !draft.isEmpty && !tab.chat.isEmpty ? "\n" : ""
+        attached = []
+        store.send(sep + draft + "\r", to: tab)
         let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         if !showTerminal, !t.isEmpty { echoes.removeAll { $0.sent.timeIntervalSinceNow < -30 }; echoes.append((t, Date())) }
         draft = ""

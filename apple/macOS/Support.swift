@@ -24,6 +24,12 @@ final class UnixSocketServer {
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+        // A client that has already gone (nc -w 1, a timed-out knife-tab) must not kill the app
+        // when its reply is written. Set on the listener, which accepted sockets inherit: on the
+        // accepted socket itself setsockopt fails with EINVAL once the peer has closed. Not
+        // signal(SIGPIPE, SIG_IGN): the shells we fork would inherit an ignored SIGPIPE.
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         var addr = makeAddr()
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bound = withUnsafePointer(to: &addr) {
@@ -78,7 +84,12 @@ final class UnixSocketServer {
         // a "tab open" forks a shell while this connection is live — without CLOEXEC the
         // child inherits it and the client never sees EOF after the reply
         _ = fcntl(client, F_SETFD, FD_CLOEXEC)
-        queue.async { [weak self] in
+        // a client that connects and says nothing is dropped instead of waited on forever
+        var patience = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &patience, socklen_t(MemoryLayout<timeval>.size))
+        // Read off the serial queue so a slow client holds up nobody else; messages are still
+        // handled one at a time, in the order they finish arriving.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var buf = Data()
             var chunk = [UInt8](repeating: 0, count: 4096)
             while true {
@@ -87,11 +98,14 @@ final class UnixSocketServer {
                 buf.append(contentsOf: chunk[0..<n])
                 if buf.count > 512 * 1024 { break }
             }
-            if let s = String(data: buf, encoding: .utf8), !s.isEmpty, let reply = self?.onMessage(s) {
-                // client half-closed its write side (python shutdown(SHUT_WR)) and is waiting for this
-                _ = reply.utf8CString.withUnsafeBufferPointer { write(client, $0.baseAddress, $0.count - 1) }
+            guard let self else { close(client); return }
+            self.queue.async {
+                if let s = String(data: buf, encoding: .utf8), !s.isEmpty, let reply = self.onMessage(s) {
+                    // client half-closed its write side (python shutdown(SHUT_WR)) and is waiting for this
+                    _ = reply.utf8CString.withUnsafeBufferPointer { write(client, $0.baseAddress, $0.count - 1) }
+                }
+                close(client)
             }
-            close(client)
         }
     }
 
@@ -140,7 +154,7 @@ enum HooksInstaller {
     static func upgrade() {
         guard let s = try? String(contentsOfFile: settingsPath, encoding: .utf8), s.contains("knife-terminal.sock") else { return }
         if !installed(at: settingsPath, events: events) || hasLegacy(at: settingsPath) {
-            _ = write(to: settingsPath, events: events)
+            _ = write(to: settingsPath, events: events, quiet: true) // at launch: a file we can't parse is skipped silently
         }
     }
 
@@ -182,13 +196,20 @@ enum HooksInstaller {
         return write(to: settingsPath, events: events) && write(to: codexPath, events: codexEvents)
     }
 
-    @MainActor
-    private static func write(to settingsPath: String, events: [String]) -> Bool {
+    /// The settings file's contents with our hooks added, or nil when the file holds
+    /// something we can't read as the JSON we expect. Nil means don't write: starting
+    /// over from an empty config would replace the user's whole settings file
+    /// (permissions, env, other hooks) with just our hooks.
+    static func merged(_ existing: Data?, events: [String], hookCmd: String) -> [String: Any]? {
         var cfg: [String: Any] = [:]
-        if let data = FileManager.default.contents(atPath: settingsPath),
-           let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { cfg = j }
+        if let existing, !(String(data: existing, encoding: .utf8) ?? "x").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let j = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] else { return nil }
+            cfg = j
+        }
+        if cfg["hooks"] != nil, !(cfg["hooks"] is [String: Any]) { return nil }
         var hooks = migrated(cfg["hooks"] as? [String: Any] ?? [:]).hooks
         for ev in events {
+            if hooks[ev] != nil, !(hooks[ev] is [Any]) { return nil }
             var arr = hooks[ev] as? [Any] ?? []
             let d = (try? JSONSerialization.data(withJSONObject: arr)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
             if !d.contains("knife-terminal.sock") {
@@ -197,6 +218,19 @@ enum HooksInstaller {
             hooks[ev] = arr
         }
         cfg["hooks"] = hooks
+        return cfg
+    }
+
+    @MainActor
+    private static func write(to settingsPath: String, events: [String], quiet: Bool = false) -> Bool {
+        guard let cfg = merged(FileManager.default.contents(atPath: settingsPath), events: events, hookCmd: hookCmd) else {
+            if !quiet {
+                let err = NSAlert(); err.messageText = "Hooks not installed"
+                err.informativeText = "\(settingsPath) is not valid JSON (or its hooks are not in the usual shape), so Knife left it alone. Fix the file and try again."
+                err.runModal()
+            }
+            return false
+        }
         do {
             try FileManager.default.createDirectory(atPath: (settingsPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
             let out = try JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
@@ -437,22 +471,25 @@ enum Projects {
             .compactMap { p -> Project? in
                 var isDir: ObjCBool = false
                 guard fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue else { return nil }
-                // most recent activity: newest transcript in ~/.claude/projects
-                // (appends bump file mtime, not the dir's), falling back to the
-                // project folder's own mtime, or an open from Knife itself
                 let enc = (projDir as NSString).appendingPathComponent(encode(p))
+                // most recently used from Knife (opened or switched to); a project never
+                // touched here falls back to its newest transcript (appends bump file
+                // mtime, not the dir's), so a busy background session can't outrank
+                // the one you just used
                 var t: TimeInterval = 0
-                for f in (try? fm.contentsOfDirectory(atPath: enc)) ?? [] {
-                    if let a = try? fm.attributesOfItem(atPath: (enc as NSString).appendingPathComponent(f)),
-                       let m = a[.modificationDate] as? Date {
-                        t = max(t, m.timeIntervalSince1970)
+                if let k = touched[p] { t = k } else {
+                    for f in (try? fm.contentsOfDirectory(atPath: enc)) ?? [] {
+                        if let a = try? fm.attributesOfItem(atPath: (enc as NSString).appendingPathComponent(f)),
+                           let m = a[.modificationDate] as? Date {
+                            t = max(t, m.timeIntervalSince1970)
+                        }
                     }
                 }
+                // a folder with no Claude history (one added from disk): its own mtime
                 if t == 0, let a = try? fm.attributesOfItem(atPath: p),
                    let m = a[.modificationDate] as? Date {
                     t = m.timeIntervalSince1970
                 }
-                t = max(t, touched[p] ?? 0)
                 return Project(path: p, name: (p as NSString).lastPathComponent, t: t)
             }
             .sorted { $0.t > $1.t }

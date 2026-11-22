@@ -10,12 +10,20 @@ public struct ScreenPrompt: Equatable, Sendable {
     public var body: [String]
     public var options: [String] // option n is options[n - 1]
 
+    /// A multi-select question: digits toggle "[ ] …" boxes, and its Submit row has no number.
+    /// → (`multiSelectSubmit`) moves on from wherever the cursor is — to the next question, or
+    /// the numbered "Submit answers" review (checked against Claude Code 2.1.278).
+    public var multiSelect: Bool { options.contains { $0.hasPrefix("[ ] ") || $0.hasPrefix("[✔] ") } }
+    public static let multiSelectSubmit = "\u{1b}[C"
+
     /// The menu at the bottom of `screen`, if one is up: numbered options 1…n (n ≥ 2)
     /// just above an "Esc to …" footer, under a ─── rule.
     public static func parse(_ screen: String) -> ScreenPrompt? {
         var lines = screen.components(separatedBy: "\n").map { $0.replacingOccurrences(of: "\u{00a0}", with: " ") }
         while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
-        guard let footer = lines.indices.last(where: { lines[$0].contains("Esc to ") }),
+        // 2.1.308 draws the "Submit answers" review with no footer; its menu is the last thing on screen
+        let reviewTail = lines.count >= 2 && lines[lines.count - 2].contains("1. Submit answers")
+        guard let footer = reviewTail ? lines.count : lines.indices.last(where: { lines[$0].contains("Esc to ") }),
               footer >= lines.count - 3 else { return nil }
         var opts: [Int: String] = [:]
         var i = footer - 1

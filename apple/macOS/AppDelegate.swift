@@ -19,6 +19,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
+    /// Dock click with only mini terminals left: bring the main window back.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if AppModel.shared.windows.isEmpty { AppModel.shared.newWindow() }
+        return true
+    }
+
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
             if url.isFileURL { AppModel.shared.dispatchOpen(url.path) }
@@ -40,6 +46,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if CKNotification(fromRemoteNotificationDictionary: userInfo) != nil {
             AppModel.shared.sync?.remotePushReceived()
         }
+    }
+
+    // Someone's Knife Terminal invited us into a session (collaborative mode)
+    func application(_ application: NSApplication, userDidAcceptCloudKitShareWith metadata: CKShare.Metadata) {
+        Collab.shared.accept(metadata)
     }
 
     func application(_ application: NSApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
@@ -77,6 +88,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         plain.keyEquivalentModifierMask = [.command, .option]; plain.target = self
         shell.addItem(withTitle: "New Mini Terminal", action: #selector(newMini), keyEquivalent: "n").target = self
         shell.addItem(withTitle: "Close Tab", action: #selector(closeTab), keyEquivalent: "w").target = self
+        shell.addItem(.separator())
+        shell.addItem(withTitle: "Invite to Session…", action: #selector(invite), keyEquivalent: "").target = self
+        shell.addItem(.separator())
+        shell.addItem(withTitle: "Share Everything with Another Mac…", action: #selector(shareZone), keyEquivalent: "").target = self
+        shell.addItem(withTitle: "Leave Shared Mac", action: #selector(leaveHostZone), keyEquivalent: "").target = self
         main.addItem(withTitle: "Shell", action: nil, keyEquivalent: "").submenu = shell
 
         let edit = NSMenu(title: "Edit")
@@ -162,6 +178,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         else { AppModel.shared.newWindow() }
     }
     @objc private func newMini() { AppModel.shared.newMiniTerm() }
+    @objc private func invite() { if let t = front?.activeTab { Collab.shared.invite(t) } }
+    @objc private func shareZone() { Collab.shared.shareZone() }
+    @objc private func leaveHostZone() { Collab.shared.leaveHostZone() }
     @objc private func closeTab() {
         // ⌘W in a mini popout closes the popout
         if let key = NSApp.keyWindow, let mini = AppModel.shared.minis.first(where: { $0.window == key }) {

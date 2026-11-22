@@ -27,7 +27,7 @@ final class MiniTermController: NSWindowController, NSWindowDelegate {
         }
         win.center()
 
-        let env = TabModel.shellEnv()
+        let env = TabModel.shellEnvironment()
         term.processDelegate = self
         term.startProcess(executable: TabModel.userShell(), args: ["-l"],
                           environment: env.map { "\($0.key)=\($0.value)" },
@@ -41,7 +41,7 @@ final class MiniTermController: NSWindowController, NSWindowDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func windowWillClose(_ notification: Notification) {
-        term.process?.terminate()
+        TabModel.terminate(term.process, session: term.process?.shellPid ?? 0)
         AppModel.shared.miniClosed(self)
     }
 }

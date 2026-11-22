@@ -11,7 +11,7 @@ final class AppModel: ObservableObject {
     let clips = ClipPile(path: Manifest.dir + "/clips.json")
     var windows: [KnifeWindowController] = []
     weak var mostRecentWindow: KnifeWindowController?
-    private var nextTabId = 1
+    private var nextTabId = Manifest.tabIdBase
     private var owner: [Int: KnifeWindowController] = [:] // tab id → window
     private var tabById: [Int: TabModel] = [:]
     var sync: SyncPublisher?
@@ -64,21 +64,33 @@ final class AppModel: ObservableObject {
                 AppModel.shared.checkSocket()
             }
         }
-        // CKContainer(identifier:) traps without the iCloud entitlement, which
-        // ad-hoc/local builds outside the CW&T team can't be provisioned for.
-        // A second Knife (another Claude account) never syncs: the phone mirror and the job runner are the
-        // main app's, and two publishers would collide on tab ids.
-        if Self.hasCloudKitEntitlement && !Instance.isSecondary {
+        if Self.syncAllowed {
             let publisher = SyncPublisher()
             sync = publisher
             publisher.start()
         }
     }
 
+    /// After joining or leaving another Mac's zone: a fresh publisher against the new zone.
+    func restartSync() {
+        sync?.stop()
+        guard Self.syncAllowed else { sync = nil; return }
+        let publisher = SyncPublisher()
+        sync = publisher
+        publisher.start()
+    }
+
+    /// CKContainer(identifier:) kills the process when the binary isn't signed
+    /// with the iCloud entitlement (e.g. unsigned local builds) — check first.
     private static var hasCloudKitEntitlement: Bool {
         guard let task = SecTaskCreateFromSelf(nil) else { return false }
         return SecTaskCopyValueForEntitlement(task, "com.apple.developer.icloud-services" as CFString, nil) != nil
     }
+
+    /// Whether this app publishes to iCloud at all. A second Knife (another Claude account) never
+    /// syncs: the phone mirror and the job runner are the main app's, and two publishers would
+    /// collide on tab ids (both instances on one Mac share Manifest.tabIdBase).
+    private static var syncAllowed: Bool { hasCloudKitEntitlement && !Instance.isSecondary }
 
     func checkSocket() { socket?.rebindIfNeeded() }
 
@@ -103,6 +115,7 @@ final class AppModel: ObservableObject {
         pendingStop[tab.id]?.cancel(); pendingStop.removeValue(forKey: tab.id)
         saveSessionSoon()
         sync?.tabClosed(tab.id)
+        Collab.shared.tabClosed(tab)
     }
 
     func processExited(tabId: Int) {
@@ -115,7 +128,9 @@ final class AppModel: ObservableObject {
         for t in wc.tabs { t.terminate(); tabClosed(t) }
         wc.tabs.removeAll()
         windows.removeAll { $0 === wc }
-        if windows.isEmpty { NSApp.terminate(nil) }
+        // a mini terminal still open keeps the app (and whatever it is running) alive; the app
+        // then quits when the last window closes (applicationShouldTerminateAfterLastWindowClosed)
+        if windows.isEmpty && minis.isEmpty { NSApp.terminate(nil) }
     }
 
     @discardableResult
@@ -182,10 +197,18 @@ final class AppModel: ObservableObject {
 
     private var jobScript: String { Bundle.main.path(forResource: Manifest.scriptName, ofType: "sh") ?? "" }
 
-    func dispatchJob(_ text: String) {
+    /// Whether this Mac takes the phone's requests (jobs, project taps). Off on a
+    /// Mac that only mirrors its own tabs while another one is the executor.
+    var executor: Bool {
+        get { UserDefaults.standard.object(forKey: "knife.executor") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "knife.executor") }
+    }
+
+    /// `here`: forwarded from the executor after routing — run it, don't route elsewhere again.
+    func dispatchJob(_ text: String, here: Bool = false) {
         let wc = frontWindow() ?? newWindow(withTab: false)
         wc.addTab(TabOptions(cwd: Manifest.dir + "/jobs",
-                             cmd: "bash \(shellQuote(jobScript)) run \(shellQuote(text))",
+                             cmd: "\(here ? "KNIFE_HERE=1 " : "")bash \(shellQuote(jobScript)) run \(shellQuote(text))",
                              title: "job: " + String(text.prefix(40))), activateIt: false)
     }
 
@@ -205,6 +228,11 @@ final class AppModel: ObservableObject {
 
     /// Turn a folder into a project: git init + private GitHub remote, then claude.
     func adoptFolder(_ dir: String) {
+        // A tab whose folder is missing starts in the home directory instead, and
+        // `adopt .` there would git-init the home directory and push it to GitHub.
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue,
+              (dir as NSString).standardizingPath != NSHomeDirectory() else { return }
         Projects.touch(dir)
         let wc = frontWindow() ?? newWindow(withTab: false)
         wc.addTab(TabOptions(cwd: dir, cmd: "bash \(shellQuote(jobScript)) adopt . && claude",
@@ -237,6 +265,12 @@ final class AppModel: ObservableObject {
             return nil
         }
         // "adopt <dir>" → git init + remote + claude tab; "alert <tab> <msg>" → attention + push (job runner)
+        // "forward <machine> <text>" → the job runner routed a request to a project that runs on another Mac
+        if trimmed.hasPrefix("forward ") {
+            let parts = trimmed.dropFirst(8).split(separator: " ", maxSplits: 1)
+            if parts.count == 2 { sync?.forward(to: String(parts[0]), path: CloudSync.jobPrefix + String(parts[1])) }
+            return nil
+        }
         if trimmed.hasPrefix("adopt ") {
             adoptFolder(String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines))
             return nil
@@ -271,6 +305,10 @@ final class AppModel: ObservableObject {
             PromptRails.shared.hookFired(tab) // the transcript moved: the rail reads it again
         }
         if type == "SessionStart" { return nil } // hooked only to learn the new transcript (/clear, resume)
+        if let tab = tabById[id] { // a question is up from its PreToolUse until any non-notification event
+            if hook["hook_event_name"] as? String == "PreToolUse", hook["tool_name"] as? String == "AskUserQuestion" { tab.askStarted() }
+            else if hook["hook_event_name"] as? String != "Notification" { tab.askEnded() }
+        }
         attention(id: id, type: type, hook: hook)
         return nil
     }
@@ -280,6 +318,7 @@ final class AppModel: ObservableObject {
     ///   type <id> <text>           text + ⏎ (paste-style, like the phone)
     ///   key <id> <keys…>           enter esc tab shift-tab space backspace up/down/left/right ctrl-<a-z> or a character
     ///   read <id>                  the rendered screen, plain text
+    ///   links <id>                 what is underlined as a link: "row col url[:line]" per span
     ///   status <id>                working | attention | idle | gone
     ///   echo <id> <text>           print a line on the tab's screen (the overseer's log, no tty needed)
     private func handleTabCommand(_ cmd: String) -> String {
@@ -322,6 +361,7 @@ final class AppModel: ObservableObject {
             }
             return "ok"
         case "read": return tab.view.plainScreen()
+        case "links": return tab.view.linkSummary()
         case "echo": tab.view.feed(text: "\r\n" + arg); return "ok"
         case "status": return tab.limited ? "limit" : tab.working ? "working" : tab.attention ? "attention" : "idle"
         default: return "error: unknown command"
@@ -472,11 +512,21 @@ final class AppModel: ObservableObject {
         // one pass over the process table for every tab: this runs on the main thread on a timer
         let agents = TabModel.agentsByShell(Set(windows.flatMap(\.tabs).map(\.shellPid).filter { $0 > 0 }))
         let saved = windows.compactMap { wc -> SavedWindow? in
-            guard !wc.tabs.isEmpty else { return nil }
+            // guest tabs come back through the share, not the session file; a job's own tab has
+            // nothing to resume and would return as an empty "job: …" shell on every launch
+            let own = wc.tabs.filter { $0.opts.guest == nil && !($0.opts.cwd == Manifest.dir + "/jobs" && $0.opts.restoreCmd == nil) }
+            guard !own.isEmpty else { return nil }
             let b = wc.window?.frame ?? .zero
-            let tabs = wc.tabs.map { t in
-                SavedTab(title: t.title, cwd: t.currentCwd,
-                         cmd: Self.restoreCommand(for: t, claudeRunning: agents[t.shellPid] == "claude"),
+            let tabs = own.map { t in
+                // A tab whose folder was missing when it opened (volume not mounted, Dropbox not
+                // synced yet) is sitting in the home directory: keep the folder it belongs to,
+                // or the next save forgets the project for good.
+                // Only while the shell is still parked there: a folder renamed or deleted under a
+                // running tab has a real cwd worth saving.
+                let live = t.currentCwd
+                let missing = (live == nil || live == NSHomeDirectory())
+                    && (t.opts.cwd.map { !FileManager.default.fileExists(atPath: $0) } ?? false)
+                return SavedTab(title: t.title, cwd: missing ? t.opts.cwd : live, cmd: Self.restoreCommand(for: t, claudeRunning: agents[t.shellPid] == "claude"),
                          active: t.id == wc.activeId, fixed: t.titleIsFixed,
                          lastActive: t.lastActivity?.timeIntervalSince1970,
                          context: t.context, contextPinned: t.contextPinned ? true : nil)
@@ -488,7 +538,7 @@ final class AppModel: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: sessionURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted]
-            try enc.encode(session).write(to: sessionURL)
+            try enc.encode(session).write(to: sessionURL, options: .atomic) // a kill mid-write must not leave half a file
         } catch {}
     }
 
