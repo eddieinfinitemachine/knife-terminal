@@ -100,6 +100,14 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
     func activate(_ id: Int) {
         guard let t = tabs.first(where: { $0.id == id }) else { return }
         activeId = id
+        if t.deferredCmd != nil {
+            // a dormant tab restored without its agent: start it once the tab has stayed open a
+            // beat, so stepping past it with ⌘⇧] doesn't
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak t] in
+                guard let self, let t, self.activeId == t.id else { return }
+                t.startDeferred()
+            }
+        }
         if NSApp.isActive, window?.isKeyWindow ?? false, t.attention {
             t.attention = false
             t.status = t.working ? .working : .idle
@@ -144,7 +152,7 @@ final class KnifeWindowController: NSWindowController, NSWindowDelegate, Observa
             return
         }
         // by executable path in one pass over the process table: claude renames its process to
-        // its version, and claudeRunning's pgrep is a subprocess
+        // its version, and a pgrep would be a subprocess
         let pid = tab.shellPid
         if pid > 0, TabModel.agentsByShell([pid])[pid] == "claude" { tab.view.typeText(text) } else { tab.view.pasteText(text) }
         if let w = window, tab.view.window === w { w.makeFirstResponder(tab.view) }

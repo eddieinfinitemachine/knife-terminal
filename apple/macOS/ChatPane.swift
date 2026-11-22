@@ -127,7 +127,7 @@ struct ChatPane: View {
             }
             // its own view: a keystroke re-renders the field, not every message above it
             Composer(font: mono(12), controller: controller) { text in
-                tab.view.typeLine(text)
+                tab.whenAgentUp { tab.view.typeLine(text) }
                 // shown at once; the transcript's copy (user record or queue entry) replaces it
                 echoes.append((text.trimmingCharacters(in: .whitespacesAndNewlines), Date()))
             }

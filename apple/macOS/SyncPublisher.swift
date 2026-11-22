@@ -168,10 +168,12 @@ final class SyncPublisher {
         for input in delta.inputs {
             guard let tab = AppModel.shared.tab(input.tabId) else { continue }
             let text = input.data
-            if text.count > 1, text.hasSuffix("\r") {
-                tab.view.typeLine(String(text.dropLast()))   // composer text: typed, not pasted
-            } else {
-                tab.view.send(txt: text)
+            tab.whenAgentUp {   // a dormant tab starts its agent first
+                if text.count > 1, text.hasSuffix("\r") {
+                    tab.view.typeLine(String(text.dropLast()))   // composer text: typed, not pasted
+                } else {
+                    tab.view.send(txt: text)
+                }
             }
         }
         // phone asked to open a project → new tab running claude, mirrored back

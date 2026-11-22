@@ -988,14 +988,21 @@ private struct ProjectRow: View {
         return age == "now" ? "just now" : age + " ago"
     }
 
-    /// Its folder in Finder, its repo's web page (from the git remote; for another Mac's
-    /// project, the manifest's).
-    @ViewBuilder
-    static func links(_ p: Project, local: Bool) -> some View {
+    static func links(_ p: Project, local: Bool) -> some View { ProjectLinksMenu(project: p, local: local) }
+}
+
+/// Its folder in Finder, its repo's web page (from the git remote; for another Mac's project, the
+/// manifest's). A view of its own for the same reason as ProjectChatsMenu below: the remote lookup
+/// stats .git/config, and inline in the .contextMenu builder that ran per row per sidebar render.
+private struct ProjectLinksMenu: View {
+    let project: Project
+    let local: Bool
+
+    var body: some View {
         if local {
-            Button("Open Folder in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath: p.path)) }
+            Button("Open Folder in Finder") { NSWorkspace.shared.open(URL(fileURLWithPath: project.path)) }
         }
-        let remote = local ? Manifest.remote(of: p.path) : Manifest.merged.first { $0.path == p.path }?.remote
+        let remote = local ? Manifest.remote(of: project.path) : Manifest.merged.first { $0.path == project.path }?.remote
         if let url = remote.flatMap(ProjectRef.webURL(forRemote:)) {
             Button("Open Repo Page (\(url.host ?? "web"))") { NSWorkspace.shared.open(url) }
         } else {

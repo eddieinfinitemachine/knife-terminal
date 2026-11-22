@@ -40,8 +40,18 @@ public enum Emoji {
         return Rule(prefix: p, substring: s, emoji: e)
     }
 
+    // A path's emoji never changes, and sidebar rows ask on every render: ~80 rules × 2 regexes per token.
+    private static let cache = NSCache<NSString, NSString>()
+
     public static func forPath(_ path: String?) -> String {
         guard let path, !path.isEmpty else { return "🔪" }
+        if let hit = cache.object(forKey: path as NSString) { return hit as String }
+        let emoji = match(path)
+        cache.setObject(emoji as NSString, forKey: path as NSString)
+        return emoji
+    }
+
+    private static func match(_ path: String) -> String {
         let name = (path as NSString).lastPathComponent
         // split camelCase, then on non-alphanumerics
         var spaced = ""

@@ -218,8 +218,10 @@ struct SessionCard: View {
         guard !text.isEmpty else { return }
         // Text and Enter in one chunk reads as a paste to TUIs; send the CR later (same as phone input).
         let view = tab.view
-        view.send(txt: text)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { view.send(txt: "\r") }
+        tab.whenAgentUp {
+            view.send(txt: text)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { view.send(txt: "\r") }
+        }
         draft = ""
     }
 }

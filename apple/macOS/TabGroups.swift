@@ -56,6 +56,22 @@ enum TabTier: String, CaseIterable {
         return .dormant
     }
 
+    /// A restored tab whose agent isn't started until the tab is opened: it's dormant, and what
+    /// it would run is an agent session. Resuming every tab at launch kept a claude (and its MCP
+    /// servers) alive per tab, used or not. Anything else (a dev server, `man ls`) runs as before.
+    static func defersRestore(cmd: String?, lastActivity: Date?, now: Date = Date()) -> Bool {
+        guard let first = cmd?.split(separator: " ").first, first == "claude" || first == "codex" else { return false }
+        return of(urgency: .none, ready: false, lastActivity: lastActivity, now: now) == .dormant
+    }
+
+    /// "claude --resume <id>" → the id, so a tab that hasn't started its agent still answers for its chat.
+    static func resumedSession(in cmd: String?) -> String? {
+        let words = cmd?.split(separator: " ").map(String.init) ?? []
+        guard words.first == "claude", let i = words.firstIndex(of: "--resume"), i + 1 < words.count,
+              words[i + 1].range(of: "^[A-Za-z0-9-]+$", options: .regularExpression) != nil else { return nil }
+        return words[i + 1]
+    }
+
     /// Its own key in the folded set: repo groups are saved as "<tier>:<repo key>", never "tier:…".
     var foldKey: String { "tier:" + rawValue }
 }

@@ -109,3 +109,13 @@ and it jumps through a null pointer (EXC_BAD_ACCESS at 0x0, `UC::DriverCore::con
 `Process`, no `waitUntilExit`, no nested run loops. Read files directly (git config is plain
 text; `Repos.originURL(inConfig:)` parses it) or compute off-main and publish into state.
 A `.contextMenu` builder runs on *every* render of the row, not only on right-click.
+
+## Shells under the Knife process are not its tabs (2026-11-17, "why is my knife app so slow")
+
+I counted Knife's child zsh processes (69), called them tabs, and timed the per-tab `pgrep` loop
+over all of them: "7.4 s freeze across 69 tabs". Knife had 29 tabs; the other 41 shells belonged
+to closed tabs that never exited (the bug found an hour later). The real figure was ~3 s.
+
+**Rule:** ask the app what it has, don't infer it from the process table: `tab status <id>` on
+the socket answers "gone" for a closed tab, and session.json lists the open ones. A mismatch
+between the two counts is itself the finding.

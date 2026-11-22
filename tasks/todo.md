@@ -241,3 +241,23 @@ real PreToolUse/SessionEnd hook command from ~/.claude-worker/settings.json flip
 First launch migrated that file's 11 Knife hooks to the KNIFE_SOCK form; other hooks and keys unchanged;
 ~/.claude/settings.json untouched. Main app (`make mac`) still builds as com.zelig.knifeterminal with iCloud and
 empty instance keys. Knife 1 was not reinstalled.
+
+## Performance: "why is my knife app so slow" (2026-11-17)
+
+Measured: load 224 on 16 cores, 64 live Claude sessions under Knife (29 tabs), main thread 0% idle.
+
+- [x] Autosave ran one `pgrep` per tab on the main thread every 15 s (~3 s freeze at that load) → one `agentsByShell` pass (1 ms, same answers on the live tabs)
+- [x] Link scan ran for background tabs on every output → only the tab in a window scans; rescan on `viewDidMoveToWindow`
+- [x] Sidebar rows: emoji regexes + `.git/config` stat per row per render → `Emoji.forPath` cached; links menu is its own view
+- [x] Closing a tab never ended its shell (SIGTERM is ignored by interactive zsh, monitor cancelled) → SIGHUP + reap in `TabModel.terminate`
+- [x] Dormant tabs restore without starting their agent; it starts when the tab has been open 0.6 s, or is sent input (socket `tab type`/`key`, phone, chat composer, board) — `TabTier.defersRestore`, `TabModel.startDeferred` / `whenAgentUp`. Rule checked against the real TabGroups.swift (71 checks, scratchpad)
+- [x] Optimised build on this Mac: `OPT` in `local.mk` (-O, whole module) for Knife and Knife 2; build log shows -O for Knife_Terminal, KnifeKit and SwiftTerm
+- [x] MCP servers: the 8 locally-run user-scope servers moved to the projects that used them in the last 30 days (hub keeps all 8); definitions backed up in `~/.claude/mcp-user-servers-backup-2026-11-17.json`
+- [x] At most 3 `xcodebuild` builds at once: `~/Code/tools/xcodebuild-gate/xcodebuild`, linked as `~/bin/xcodebuild`
+- [x] `make install-mac` (previous app zipped beside session.json for rollback); Eddie relaunches (the session runs inside Knife)
+- [x] Knife 2 rebuilt and installed with the same fixes and `$(OPT)` (`make install-mac-2`, com.zelig.knifeterminal.2, no iCloud entitlement); it was not running, previous app zipped beside its session.json
+- [ ] Hands-on QA after relaunch (not driven by hand, the app can't be run twice): a dormant tab shows a shell, then resumes ~0.6 s after it's opened; stepping past dormant tabs with ⌘⇧] starts nothing; closing a tab ends its claude (`pgrep -P <Knife pid>` count = tab count); links underline after switching tabs; phone/chat input to a dormant tab arrives after its agent is up
+
+**Review**: stopped 33 dormant sessions by hand first (67 → 35 claude processes). Old code timed on the live tabs:
+29 `pgrep`s = ~3 s on the main thread at load 224, ~1 s at load 90; replacement 1 ms with identical answers.
+Not verified live: everything in the QA line above — the running app is the Oct 29 build until relaunch.

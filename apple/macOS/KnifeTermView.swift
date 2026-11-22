@@ -86,6 +86,11 @@ final class KnifeTermView: LocalProcessTerminalView {
         scheduleLinkScan()
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        scheduleLinkScan() // links weren't tracked while this tab was in the background
+    }
+
     override nonisolated func bell(source: Terminal) {
         DispatchQueue.main.async { [weak self] in self?.onBell?() }
     }
@@ -393,7 +398,10 @@ final class KnifeTermView: LocalProcessTerminalView {
     static let urlDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 
     func scheduleLinkScan() { // also ThemeManager, after a text size change
-        guard !linkScanPending else { return }
+        // Only the tab on screen has underlines to keep current. A background tab's output would
+        // otherwise run the detector over its whole screen on the main thread ~7×/s per busy tab;
+        // it rescans when it's shown (viewDidMoveToWindow), and a click rescans before it looks up.
+        guard window != nil, !linkScanPending else { return }
         linkScanPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self else { return }

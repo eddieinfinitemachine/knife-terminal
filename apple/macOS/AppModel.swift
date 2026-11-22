@@ -303,7 +303,7 @@ final class AppModel: ObservableObject {
         switch verb {
         case "type":
             tab.working = false; tab.attention = false; tab.limited = false; tabStateChanged(tab)   // like a keypress: stale "waiting" cleared
-            tab.view.typeLine(arg)
+            tab.whenAgentUp { tab.view.typeLine(arg) }
             return "ok"
         case "key":   // one or more keys, space-separated, ~150 ms apart (menus need the gap)
             let keys = ["enter": "\r", "esc": "\u{1b}", "tab": "\t", "shift-tab": "\u{1b}[Z", "space": " ",
@@ -317,7 +317,9 @@ final class AppModel: ObservableObject {
             }
             tab.working = false; tab.attention = false; tab.limited = false; tabStateChanged(tab)
             let view = tab.view
-            for (i, seq) in seqs.enumerated() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15 * Double(i)) { view.send(txt: seq) } }
+            tab.whenAgentUp {
+                for (i, seq) in seqs.enumerated() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15 * Double(i)) { view.send(txt: seq) } }
+            }
             return "ok"
         case "read": return tab.view.plainScreen()
         case "echo": tab.view.feed(text: "\r\n" + arg); return "ok"
@@ -467,11 +469,14 @@ final class AppModel: ObservableObject {
     }
 
     func saveSession() {
+        // one pass over the process table for every tab: this runs on the main thread on a timer
+        let agents = TabModel.agentsByShell(Set(windows.flatMap(\.tabs).map(\.shellPid).filter { $0 > 0 }))
         let saved = windows.compactMap { wc -> SavedWindow? in
             guard !wc.tabs.isEmpty else { return nil }
             let b = wc.window?.frame ?? .zero
             let tabs = wc.tabs.map { t in
-                SavedTab(title: t.title, cwd: t.currentCwd, cmd: Self.restoreCommand(for: t),
+                SavedTab(title: t.title, cwd: t.currentCwd,
+                         cmd: Self.restoreCommand(for: t, claudeRunning: agents[t.shellPid] == "claude"),
                          active: t.id == wc.activeId, fixed: t.titleIsFixed,
                          lastActive: t.lastActivity?.timeIntervalSince1970,
                          context: t.context, contextPinned: t.contextPinned ? true : nil)
@@ -492,8 +497,8 @@ final class AppModel: ObservableObject {
     /// have told us its id; a Claude tab we only know is running (hooks off, or
     /// a session older than the hooks) continues the most recent one in its
     /// cwd; anything else keeps whatever it was opened with.
-    static func restoreCommand(for t: TabModel) -> String? {
-        guard t.claudeRunning else { return t.opts.restoreCmd }
+    static func restoreCommand(for t: TabModel, claudeRunning: Bool) -> String? {
+        guard claudeRunning else { return t.opts.restoreCmd }
         if let sid = t.sessionId { return "claude --resume \(sid)" }
         return t.opts.restoreCmd ?? "claude -c"
     }
@@ -524,12 +529,14 @@ final class AppModel: ObservableObject {
             for t in w.tabs where t.cwd != nil {
                 let isShellName = t.title?.range(of: "^shell \\d+$", options: .regularExpression) != nil
                 let fixed = t.fixed ?? (t.cmd != nil) // older files: only sidebar tabs had a cmd
+                let lastActivity = t.lastActive.map(Date.init(timeIntervalSince1970:))
                 let tab = wc.addTab(TabOptions(cwd: t.cwd, cmd: t.cmd,
                                                title: fixed ? t.title : nil,
                                                shownTitle: isShellName ? nil : t.title,
                                                context: t.context, contextPinned: t.contextPinned ?? false,
                                                restoreCmd: t.cmd,
-                                               lastActivity: t.lastActive.map(Date.init(timeIntervalSince1970:))),
+                                               deferCmd: TabTier.defersRestore(cmd: t.cmd, lastActivity: lastActivity),
+                                               lastActivity: lastActivity),
                                     activateIt: false)
                 if t.active == true, activeTabId == nil { activeTabId = tab.id }
             }

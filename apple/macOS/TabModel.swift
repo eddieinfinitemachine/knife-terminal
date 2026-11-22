@@ -10,6 +10,7 @@ struct TabOptions {
     var context: String?      // restored context line (see TabModel.context)
     var contextPinned = false
     var restoreCmd: String?
+    var deferCmd = false      // restored dormant: cmd waits until the tab is opened (TabTier.defersRestore)
     var lastActivity: Date?   // restored from the session file, or now for a tab opened to work in
 }
 
@@ -67,13 +68,34 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
     var lastReportedCwd: String? // OSC 7, when the shell emits it
     var shellPid: pid_t { view.process?.shellPid ?? 0 }
 
-    /// Agent process alive under this tab's shell right now, if any.
-    var runningAgent: String? {
-        let pid = shellPid
-        return pid > 0 ? Self.runningAgent(underShell: pid) : nil
+    /// The agent command a dormant restored tab hasn't run yet: its shell is up, its agent isn't.
+    private(set) var deferredCmd: String?
+
+    /// Start the agent a dormant restored tab was holding back. False when there was nothing to start.
+    @discardableResult
+    func startDeferred() -> Bool {
+        guard let cmd = deferredCmd else { return false }
+        deferredCmd = nil
+        view.send(txt: cmd + "\r")
+        return true
     }
 
-    var claudeRunning: Bool { runningAgent == "claude" }
+    /// Run `deliver` when this tab's agent can take it: at once, or — for a dormant tab that hadn't
+    /// started its agent — after starting it and seeing its process come up. The command line goes
+    /// in first, so what's delivered can't land on the bare shell prompt; if the agent never comes
+    /// up it's dropped rather than run as a shell command.
+    func whenAgentUp(_ deliver: @escaping () -> Void) {
+        guard startDeferred() else { deliver(); return }
+        let pid = shellPid
+        Task { @MainActor in
+            for _ in 0..<60 where Self.agentsByShell([pid])[pid] == nil {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            guard Self.agentsByShell([pid])[pid] != nil else { return }
+            try? await Task.sleep(nanoseconds: 4_000_000_000)   // its input box isn't up the instant its process is
+            deliver()
+        }
+    }
 
     /// Which of these shells has an agent running under it, in one pass over the
     /// process table (under a millisecond). A pgrep per tab is a subprocess per
@@ -104,29 +126,6 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
             else if name == "codex" || path.contains("/codex/") { out[parent] = "codex" }
         }
         return out
-    }
-
-    /// `pgrep -lfP <shell>` lists direct children as "<pid> <full command>";
-    /// agents run as direct children of the shell whether typed or launched by us.
-    nonisolated static func runningAgent(underShell pid: pid_t) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-lfP", String(pid)]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
-        do { try p.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard let out = String(data: data, encoding: .utf8) else { return nil }
-        for line in out.split(separator: "\n") {
-            guard let sp = line.firstIndex(of: " ") else { continue }
-            let cmd = line[line.index(after: sp)...]
-            let exe = cmd.split(separator: " ", maxSplits: 1).first.map(String.init) ?? ""
-            let name = (exe as NSString).lastPathComponent
-            if name == "claude" || name == "codex" { return name }
-        }
-        return nil
     }
 
     /// Current working directory of the shell, for session restore + context files.
@@ -193,8 +192,13 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
         refreshRepoGroup() // before the first render, so a new tab lands in its group at once
 
         if let cmd = opts.cmd {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.view.send(txt: cmd + "\r")
+            if opts.deferCmd {
+                deferredCmd = cmd
+                sessionId = TabTier.resumedSession(in: cmd)   // "resume chat" finds this tab instead of opening a second one
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                    self?.view.send(txt: cmd + "\r")
+                }
             }
         }
         // Typing acknowledges a finished or waiting session. It doesn't mean Claude
@@ -252,7 +256,15 @@ final class TabModel: NSObject, ObservableObject, Identifiable {
     }
 
     func terminate() {
+        // SwiftTerm's terminate sends the shell SIGTERM, which an interactive zsh ignores, then
+        // stops watching it — so a closed tab's shell, its claude and every MCP server under it
+        // lived on with no tab (41 of them after a day). SIGHUP is what a closing terminal means:
+        // zsh exits and takes its jobs with it. Then reap it, or each closed tab leaves a zombie.
+        let pid = shellPid
         view.process?.terminate()
+        guard pid > 0 else { return }
+        kill(pid, SIGHUP)
+        DispatchQueue.global(qos: .utility).async { var status: Int32 = 0; waitpid(pid, &status, 0) }
     }
 }
 
