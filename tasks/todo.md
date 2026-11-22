@@ -272,7 +272,10 @@ work (its own commit) + tag `v1.4.33-eddie`. The main checkout and `knife-2` wer
 - [x] Upstream fixed two of the same things independently: origin parsing (kept upstream's `Manifest.originURL`, origin-only like `git remote get-url origin`) and orphaned shells on tab close (upstream's session sweep + SIGKILL after 2 s, with the perf SIGHUP + reap folded into the shared `TabModel.terminate(_:session:)`, so mini terminals get it too)
 - [x] Semantic fixes in merged code: slash-command lookup reads `Instance.claudeDir`; `restartSync()` (new, zone join/leave) is gated like `start()` (`syncAllowed`: entitlement and not Knife 2); "Run Jobs On" hidden in Knife 2 (it would rewrite the main app's ~/.knife/manifest.json); phone photo paste waits for a dormant tab's agent; `make mac-2` gets the release's optimisation flags
 - [x] Built, not installed: `KnifeMac` as Knife Terminal (com.zelig.knifeterminal, 1.4.33 / 1.1.13) and as Knife 2 (com.zelig.knifeterminal.2, KnifeInstance 2, ~/.claude-worker, no iCloud entitlement); KnifeKit `swift test` 17/17; `apple/knife-job-check.sh` ok
-- [ ] Hands-on QA of the merged app (and of the perf QA line above) after Eddie installs it; then fast-forward `knife-2`
+- [x] `knife-2` in the main checkout fast-forwarded to the merge (`3c0133e`); the uncommitted perf diff was identical to commit `6fe5fd4`, so nothing was left over. Gold-dot `apple/Resources/icon.icns` kept (skip-worktree); the old tracked `build/icon.icns` is still in git at `1d14b1a`
+- [x] Installed from the main checkout: `make install-mac` and `make install-mac-2` → both apps 1.4.33 (1.1.13). Previous apps zipped beside each session.json as "(Nov 17 build).zip". Knife was not relaunched (this session runs inside it): the running app is still the Nov 17 build until Eddie relaunches
+- [ ] Hands-on QA of the merged app (and of the perf QA line above) after relaunch
+- [x] Pushed `knife-2` to `eddie/knife-2` (the fork-release workflow only runs for `main` and `claude/**`, so no CI build); merge worktree and branch `knife-2-1.4.33` removed
 
 **Review**: the release untracks `build/` (and deletes the tracked `build/icon.icns`, the source of the local gold-dot
 `apple/Resources/icon.icns`, which stays skip-worktree). Merging into the main checkout would delete that file there:
